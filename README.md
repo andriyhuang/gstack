@@ -121,14 +121,14 @@ Or target a specific agent with `./setup --host <name>`:
 | Kiro | `--host kiro` | `~/.kiro/skills/gstack-*/` |
 | Hermes | `--host hermes` | `~/.hermes/skills/gstack-*/` |
 | GBrain (mod) | `--host gbrain` | `~/.gbrain/skills/gstack-*/` |
-| Qoder | `--host qoder` | `~/.lingma/skills/gstack-*/` |
+| Qoder | `--host qoder` | `~/.qoder/skills/gstack-*/` |
 
 You can also install skills to a custom directory with `--dir` (useful for
 project-level skill installations):
 
 ```bash
 # Install Qoder skills to a project-local directory
-./setup --host qoder --dir ./my-project/.lingma/skills
+./setup --host qoder --dir ./my-project/.qoder/skills
 ```
 
 **Want to add support for another agent?** See [docs/ADDING_A_HOST.md](docs/ADDING_A_HOST.md).
@@ -369,7 +369,7 @@ rm -rf ~/.codex/skills/gstack* 2>/dev/null
 rm -rf ~/.factory/skills/gstack* 2>/dev/null
 rm -rf ~/.kiro/skills/gstack* 2>/dev/null
 rm -rf ~/.openclaw/skills/gstack* 2>/dev/null
-rm -rf ~/.lingma/skills/gstack* 2>/dev/null
+rm -rf ~/.qoder/skills/gstack* 2>/dev/null
 
 # 6. Remove temp files
 rm -f /tmp/gstack-* 2>/dev/null

@@ -29,7 +29,7 @@ FACTORY_SKILLS="$HOME/.factory/skills"
 FACTORY_GSTACK="$FACTORY_SKILLS/gstack"
 OPENCODE_SKILLS="$HOME/.config/opencode/skills"
 OPENCODE_GSTACK="$OPENCODE_SKILLS/gstack"
-QODER_SKILLS="$HOME/.lingma/skills"
+QODER_SKILLS="$HOME/.qoder/skills"
 QODER_GSTACK="$QODER_SKILLS/gstack"
 
 IS_WINDOWS=0
@@ -950,7 +950,7 @@ create_opencode_runtime_root() {
 create_qoder_runtime_root() {
   local gstack_dir="$1"
   local qoder_gstack="$2"
-  local qoder_dir="$gstack_dir/.lingma/skills"
+  local qoder_dir="$gstack_dir/.qoder/skills"
 
   if [ -L "$qoder_gstack" ]; then
     rm -f "$qoder_gstack"
@@ -1067,16 +1067,16 @@ link_opencode_skill_dirs() {
 link_qoder_skill_dirs() {
   local gstack_dir="$1"
   local skills_dir="$2"
-  local qoder_dir="$gstack_dir/.lingma/skills"
+  local qoder_dir="$gstack_dir/.qoder/skills"
   local linked=()
 
   if [ ! -d "$qoder_dir" ]; then
-    echo "  Generating .lingma/ skill docs..."
+    echo "  Generating .qoder/ skill docs..."
     ( cd "$gstack_dir" && bun run gen:skill-docs --host qoder )
   fi
 
   if [ ! -d "$qoder_dir" ]; then
-    echo "  warning: .lingma/skills/ generation failed — run 'bun run gen:skill-docs --host qoder' manually" >&2
+    echo "  warning: .qoder/skills/ generation failed — run 'bun run gen:skill-docs --host qoder' manually" >&2
     return 1
   fi
 
