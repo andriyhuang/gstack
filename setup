@@ -50,7 +50,7 @@ esac
 _link_or_copy() {
   local src="$1"
   local dst="$2"
-  if [ "$IS_WINDOWS" -eq 1 ]; then
+  if [ "$IS_WINDOWS" -eq 1 ] || [ "$COPY_MODE" -eq 1 ]; then
     rm -rf "$dst"
     # Unix `ln -snf` accepts a name-only or relative-path source even when the
     # target doesn't resolve from CWD (e.g. the connect-chrome alias points at
@@ -90,6 +90,7 @@ SKILL_PREFIX_FLAG=0
 TEAM_MODE=0
 NO_TEAM_MODE=0
 CUSTOM_DIR=""
+COPY_MODE=0
 PLAN_TUNE_HOOKS_MODE=""   # "" = resolve from env/config/prompt; "yes"/"no" = explicit
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -102,6 +103,7 @@ while [ $# -gt 0 ]; do
     --no-prefix) SKILL_PREFIX=0; SKILL_PREFIX_FLAG=1; shift ;;
     --team)    TEAM_MODE=1; shift ;;
     --no-team) NO_TEAM_MODE=1; shift ;;
+    --copy) COPY_MODE=1; shift ;;
     --plan-tune-hooks)    PLAN_TUNE_HOOKS_MODE="yes"; shift ;;
     --no-plan-tune-hooks) PLAN_TUNE_HOOKS_MODE="no"; shift ;;
     --plan-tune-hooks=*)  PLAN_TUNE_HOOKS_MODE="${1#--plan-tune-hooks=}"; shift ;;
@@ -1325,6 +1327,9 @@ if [ "$INSTALL_QODER" -eq 1 ]; then
   echo "gstack ready (qoder)."
   echo "  browse: $BROWSE_BIN"
   echo "  qoder skills: $QODER_SKILLS"
+  if [ "$COPY_MODE" -eq 1 ]; then
+    echo "  install mode: copy (re-run ./setup after 'git pull' to refresh)"
+  fi
 fi
 
 # 7. Create .agents/ sidecar symlinks for the real Codex skill target.

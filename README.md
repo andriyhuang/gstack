@@ -129,6 +129,9 @@ project-level skill installations):
 ```bash
 # Install Qoder skills to a project-local directory
 ./setup --host qoder --dir ./my-project/.qoder/skills
+
+# Install Qoder skills with file copies instead of symlinks
+./setup --host qoder --copy
 ```
 
 **Want to add support for another agent?** See [docs/ADDING_A_HOST.md](docs/ADDING_A_HOST.md).
