@@ -30,6 +30,11 @@ describe('token-registry', () => {
       expect(() => createToken({ clientId: '  root  ' })).toThrow(ReservedClientIdError);
     });
 
+    it('createToken rejects the session: prefix agent sessions own tabs under', () => {
+      expect(() => createToken({ clientId: 'session:agent-1234' })).toThrow(ReservedClientIdError);
+      expect(() => createToken({ clientId: 'Session:x' })).toThrow(ReservedClientIdError);
+    });
+
     it('createToken rejects empty / whitespace clientId', () => {
       expect(() => createToken({ clientId: '' })).toThrow(ReservedClientIdError);
       expect(() => createToken({ clientId: '   ' })).toThrow(ReservedClientIdError);
@@ -233,13 +238,17 @@ describe('token-registry', () => {
 
     it('rejects expired setup key', () => {
       const setup = createSetupKey({});
-      // Manually expire it
-      const info = validateToken(setup.token);
-      if (info) {
-        (info as any).expiresAt = new Date(Date.now() - 1000).toISOString();
-      }
+      // Manually expire it (createSetupKey returns the registry's own record)
+      setup.expiresAt = new Date(Date.now() - 1000).toISOString();
       const session = exchangeSetupKey(setup.token);
       expect(session).toBeNull();
+    });
+
+    it('does not accept an unexchanged setup key as a bearer token', () => {
+      const setup = createSetupKey({ scopes: ['read', 'write'] });
+      expect(validateToken(setup.token)).toBeNull();
+      const session = exchangeSetupKey(setup.token);
+      expect(validateToken(session!.token)).not.toBeNull();
     });
 
     it('rejects unknown setup key', () => {

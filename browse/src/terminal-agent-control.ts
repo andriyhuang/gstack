@@ -22,10 +22,12 @@ import { safeUnlink, isProcessAlive } from './error-handling';
 import { restrictFilePermissions, mkdirSecure } from './file-permissions';
 import { atomicWriteSync } from '../../lib/fs-atomic';
 import { readPidCmdline, readPidStartTime } from './xvfb';
+import { emptyBunConfig, findWindowsBunExe, type BunExeLookup } from './bun-child-config';
 
-function agentProcessInfo(pid: number): { startTime: string; commandLine: string } {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return { startTime: '', commandLine: '' };
-  if (process.platform !== 'win32') return { startTime: readPidStartTime(pid), commandLine: readPidCmdline(pid) };
+const FILETIME_UNIX_EPOCH_MS = 11_644_473_600_000n;
+let win32Kernel: any;
+
+function windowsProcessQuery(pid: number): { startTime: string; commandLine: string } {
   const script = `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' | Select-Object CreationDate,CommandLine | ConvertTo-Json -Compress)`;
   try {
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true, timeout: 2000 });
@@ -35,22 +37,117 @@ function agentProcessInfo(pid: number): { startTime: string; commandLine: string
   } catch { return { startTime: '', commandLine: '' }; }
 }
 
+export const win32CreationTimeSource = {
+  read(pid: number): string | undefined {
+    if (!process.versions.bun) return;
+    try {
+      const { dlopen, FFIType, ptr } = require('bun:ffi');
+      win32Kernel ??= dlopen('kernel32.dll', {
+        OpenProcess: { args: [FFIType.u32, FFIType.i32, FFIType.u32], returns: FFIType.u64 },
+        GetProcessTimes: { args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+        CloseHandle: { args: [FFIType.u64], returns: FFIType.i32 },
+      }).symbols;
+      const handle = win32Kernel.OpenProcess(0x1000, 0, pid);
+      if (!handle) return;
+      try {
+        const times = new BigUint64Array(4);
+        if (!win32Kernel.GetProcessTimes(handle, ptr(times, 0), ptr(times, 8), ptr(times, 16), ptr(times, 24)) || times[0] === 0n) return;
+        return `/Date(${times[0] / 10_000n - FILETIME_UNIX_EPOCH_MS})/`;
+      } finally {
+        win32Kernel.CloseHandle(handle);
+      }
+    } catch { return; }
+  },
+};
+
+function agentProcessInfo(pid: number): { startTime: string; commandLine: string } {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { startTime: '', commandLine: '' };
+  if (process.platform !== 'win32') return { startTime: readPidStartTime(pid), commandLine: readPidCmdline(pid) };
+  const query = windowsProcessQuery(pid);
+  return { startTime: win32CreationTimeSource.read(pid) ?? query.startTime, commandLine: query.commandLine };
+}
+
 export function readAgentStartTime(pid: number): string {
-  return agentProcessInfo(pid).startTime;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return '';
+  if (process.platform !== 'win32') return readPidStartTime(pid);
+  return win32CreationTimeSource.read(pid) ?? windowsProcessQuery(pid).startTime;
 }
 
 const pendingAgentExits = new Set<any>();
 
-export function acquireAgentStateLock(stateDir: string, waitMs = 5000): () => void {
+function reclaimPublicationLock(stateDir: string, lockPath: string): boolean {
+  try {
+    const inode = fs.lstatSync(lockPath, { bigint: true });
+    if (!inode.isFile() || inode.size === 0n || inode.size > 4096n) return false;
+    const contents = fs.readFileSync(lockPath, 'utf8');
+    const lock = JSON.parse(contents);
+    const record = readAgentRecord(stateDir);
+    if (lock?.kind !== 'agent-publication-v1' || !record
+      || !Number.isSafeInteger(record.pid) || record.pid <= 0
+      || typeof record.gen !== 'string' || !record.gen
+      || typeof record.startTime !== 'string' || !record.startTime
+      || record.ownerPid !== process.pid
+      || typeof record.ownerStartTime !== 'string' || !record.ownerStartTime) return false;
+    const fields = ['pid', 'gen', 'startTime', 'ownerPid', 'ownerStartTime'] as const;
+    if (fields.some(field => lock[field] !== record[field])
+      || readAgentStartTime(process.pid) !== record.ownerStartTime) return false;
+    let present = true;
+    try { process.kill(record.pid, 0); }
+    catch (err: any) {
+      if (err?.code !== 'ESRCH') return false;
+      present = false;
+    }
+    if (present) {
+      if (readAgentStartTime(record.pid) !== record.startTime) return false;
+      if (process.platform === 'linux') {
+        const state = fs.readFileSync(`/proc/${record.pid}/stat`, 'utf8').match(/^\d+ \(.*\) ([A-Z])/u)?.[1];
+        if (state !== 'Z') return false;
+      } else if (process.platform === 'darwin') {
+        const result = spawnSync('ps', ['-p', String(record.pid), '-o', 'stat='], { encoding: 'utf8', windowsHide: true, timeout: 2000 });
+        if (result.status !== 0 || result.stdout?.trim()?.[0] !== 'Z') return false;
+      } else return false;
+    }
+    const currentRecord = readAgentRecord(stateDir);
+    if (!currentRecord || fields.some(field => currentRecord[field] !== record[field])) return false;
+    if (present && readAgentStartTime(record.pid) !== record.startTime) return false;
+    if (fs.readFileSync(lockPath, 'utf8') !== contents) return false;
+    const current = fs.lstatSync(lockPath, { bigint: true });
+    if (!current.isFile() || current.dev !== inode.dev || current.ino !== inode.ino) return false;
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch { return false; }
+}
+
+export function acquireAgentStateLock(stateDir: string, waitMs = 5000, publicationGen?: string): () => void {
   mkdirSecure(stateDir);
   const lockPath = path.join(stateDir, 'terminal-agent-pid.lock');
+  let publication: string | undefined;
+  if (publicationGen !== undefined) {
+    const record = readAgentRecord(stateDir);
+    if (!record || record.pid !== process.pid || record.gen !== publicationGen
+      || !record.ownerPid || !isOurAgent(record, record.ownerPid)) {
+      throw new Error('terminal-agent publication lock identity is unavailable');
+    }
+    publication = JSON.stringify({ kind: 'agent-publication-v1', pid: record.pid, gen: record.gen,
+      startTime: record.startTime, ownerPid: record.ownerPid, ownerStartTime: record.ownerStartTime });
+  }
   const deadline = Date.now() + waitMs;
+  let reclaimed = false;
   let fd: number;
   while (true) {
     try {
-      fd = fs.openSync(lockPath, 'wx', 0o600);
+      if (publication !== undefined) {
+        atomicWriteSync(lockPath, publication, { mode: 0o600, noReplace: true });
+        fd = fs.openSync(lockPath, 'r');
+      } else {
+        fd = fs.openSync(lockPath, 'wx', 0o600);
+      }
       break;
     } catch (err: any) {
+      if (err?.code === 'EEXIST' && !reclaimed && reclaimPublicationLock(stateDir, lockPath)) {
+        reclaimed = true;
+        continue;
+      }
       if (err?.code !== 'EEXIST' || Date.now() >= deadline) {
         throw new Error(`terminal-agent state lock unavailable at ${lockPath}: ${err?.code || err}; inspect the owning process before manual recovery`);
       }
@@ -75,6 +172,32 @@ export function acquireAgentStateLock(stateDir: string, waitMs = 5000): () => vo
  * exposes it relative to process.execPath. Either path must work or
  * the agent can't be spawned at all.
  */
+/**
+ * Flags for every `bun run` child the daemon spawns. The child runs in the
+ * user's project, and Bun would otherwise load that project's .env (which can
+ * set GSTACK_CHROMIUM_NO_SANDBOX) and bunfig.toml (whose preload runs code).
+ * Built per spawn so the empty config is re-checked each time.
+ */
+export function bunChildFlags(): string[] {
+  return ['--no-env-file', `--config=${emptyBunConfig()}`];
+}
+
+/**
+ * The bun executable to spawn the agent with. On Windows a bare 'bun' under
+ * the Node polyfill resolves (via cross-spawn) to npm's bun.cmd shim, run as
+ * `cmd.exe /c bun ...`. That breaks two ways: windowsHide only hides cmd.exe,
+ * and the detached cmd.exe has no console, so bun.exe allocates a fresh
+ * visible one (a window that steals focus on every spawn); and proc.pid is
+ * cmd.exe's, so the agent's startup check (record.pid === process.pid) never
+ * matches and it exits after 2s, which the 60s watchdog then respawns.
+ * Spawning bun.exe directly fixes both. Falls back to 'bun' when no .exe is
+ * found, which is the old behavior.
+ */
+export function resolveBunExecutable(opts: BunExeLookup & { platform?: string } = {}): string {
+  if ((opts.platform ?? process.platform) !== 'win32') return 'bun';
+  return findWindowsBunExe(opts) ?? 'bun';
+}
+
 export function resolveTerminalAgentScript(searchHints: { metaDir?: string; execPath?: string } = {}): string | null {
   const meta = searchHints.metaDir || __dirname;
   const exec = searchHints.execPath || process.execPath;
@@ -134,7 +257,7 @@ export function spawnTerminalAgent(opts: {
     writeAgentRecord(stateDir, reservation);
     let proc: any;
     try {
-      proc = (Bun as any).spawn(['bun', 'run', script, `--agent-gen=${gen}`], {
+      proc = (Bun as any).spawn([resolveBunExecutable(), 'run', ...bunChildFlags(), script, `--agent-gen=${gen}`], {
         cwd: opts.cwd || process.cwd(),
         env: {
           ...process.env,
@@ -147,6 +270,10 @@ export function spawnTerminalAgent(opts: {
         },
         stdio: ['ignore', 'ignore', 'ignore'],
         windowsHide: true,
+        // A non-detached Windows child is killed with its parent's job, so an
+        // agent started by `browse connect` died when the CLI exited (#2637).
+        // The owner watchdog (BROWSE_OWNER_PID) still ends it with the daemon.
+        detached: process.platform === 'win32',
       });
     } catch (err) {
       clearAgentRecord(stateDir, reservation);
@@ -241,7 +368,8 @@ function agentStatus(record: AgentRecord, ownerPid?: number): 'owned' | 'gone' |
   if (ownerPid !== undefined && (record.ownerPid !== ownerPid || record.ownerStartTime !== readAgentStartTime(ownerPid))) return 'unknown';
   const actual = agentProcessInfo(record.pid);
   if (!actual.startTime) return isAgentRecordLive(record) ? 'unknown' : 'gone';
-  if (actual.startTime !== record.startTime) return 'gone';
+  if (actual.startTime !== record.startTime && process.platform !== 'win32') return 'gone';
+  if (actual.startTime !== record.startTime && !actual.commandLine) return 'unknown';
   try {
     let state: string | undefined;
     if (process.platform === 'linux') {
@@ -254,7 +382,7 @@ function agentStatus(record: AgentRecord, ownerPid?: number): 'owned' | 'gone' |
   } catch {}
   if (!isAgentRecordLive(record)) return 'gone';
   return actual.commandLine.split(/\s+/).some(arg => arg.replace(/^['"]|['"]$/g, '') === `--agent-gen=${record.gen}`)
-    ? 'owned' : 'unknown';
+    ? 'owned' : actual.startTime === record.startTime ? 'unknown' : 'gone';
 }
 
 export function isOurAgent(record: AgentRecord, ownerPid?: number): boolean {

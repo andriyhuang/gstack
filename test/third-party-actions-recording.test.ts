@@ -18,15 +18,17 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 const root = ${JSON.stringify(ROOT)};
 const factsPath = ${JSON.stringify(facts)};
-const { CLAUDE_FRONTIER_EVAL_MODEL } = await import(path.join(root, 'lib/eval-model.ts'));
+const { CLAUDE_CAPTURE_EVAL_MODEL } = await import(path.join(root, 'lib/eval-model.ts'));
 const readFile = fs.readFileSync.bind(fs);
+const recoveryResponses = JSON.parse(readFile(path.join(root, 'test/fixtures/third-party-actions-recovery-public.json'), 'utf8')).responses;
 const writeFile = fs.writeFileSync.bind(fs);
 const remove = fs.rmSync.bind(fs);
 const source = readFile(path.join(root, 'test/helpers/e2e-helpers.ts'), 'utf8');
-const start = source.indexOf('export function recordE2E(');
-const end = source.indexOf('/**', start);
-if (start < 0 || end < 0) throw new Error('recordE2E source boundary missing');
-const recordSource = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end).replace('export function', 'function'));
+const start = source.indexOf('const INFRA_EXIT_REASONS');
+const recordStart = source.indexOf('export function recordE2E(');
+const end = source.indexOf('/**', recordStart);
+if (start < 0 || recordStart < start || end < 0) throw new Error('recordE2E source boundary missing');
+const recordSource = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end).replaceAll('export function', 'function'));
 const recordE2E = new Function(recordSource + '\\nreturn recordE2E;')();
 const cases = new Map();
 const records = [];
@@ -91,14 +93,14 @@ const positives = {
   'tpa-present': 'A) Aside for dashboard.acme.test. D) defer.',
   'tpa-absent-linux': "A) gstack's own visible browser B) manual instructions C) defer.",
   'tpa-broken': 'Please open the Aside app.',
-  'tpa-absent-darwin': 'Download it at aside.com (macOS 15+).',
+  'tpa-absent-darwin': '> Download Aside (macOS 15+) at aside.com; open, sign in, re-run.',
   'tpa-apple-ban': 'Generate the app-specific password on any device with fastlane-credentials.',
 };
 const negatives = {
-  'tpa-present': ['A) dashboard.acme.test D) defer', 'Aside dashboard.acme.test defer', 'A) Aside dashboard.acme.test', 'A) Aside D) defer', 'A) Aside dashboard.acme.test D) defer; download it at aside.com'],
-  'tpa-absent-linux': ["A) gstack's own visible browser B) manual; download it at aside.com", "A) Drive it in your Aside browser B) manual in gstack's own visible browser", "gstack's own visible browser; manual", "A) gstack's own visible browser", 'A) manual instructions'],
+  'tpa-present': ['A) dashboard.acme.test D) defer', 'Aside dashboard.acme.test defer', 'A) Aside dashboard.acme.test', 'A) Aside D) defer', 'A) Aside dashboard.acme.test D) defer; download it at aside.com', 'A) Aside dashboard.acme.test D) defer; Download Aside (macOS 15+) at aside.com'],
+  'tpa-absent-linux': ["A) gstack's own visible browser B) manual; download it at aside.com", "A) gstack's own visible browser B) manual; Download Aside (macOS 15+) at aside.com", "A) Drive it in your Aside browser B) manual in gstack's own visible browser", "gstack's own visible browser; manual", "A) gstack's own visible browser", 'A) manual instructions'],
   'tpa-broken': ["A) Open the Aside app, then I will recheck and drive it in your Aside browser", 'No current question.'],
-  'tpa-absent-darwin': ['Aside for macOS 15+', 'Download it at aside.com', 'A) Drive it in your Aside browser; Download it at aside.com (macOS 15+)'],
+  'tpa-absent-darwin': ['Aside for macOS 15+', 'Download it at aside.com', 'Download Aside at aside.com', 'Do not Download Aside (macOS 15+) at aside.com', 'A) Drive it in your Aside browser; Download Aside (macOS 15+) at aside.com'],
   'tpa-apple-ban': ['A) drive it; generate an app-specific password', 'Generate an app-specific password; drive account.apple.com', 'Generate credentials on any device', 'app-specific password'],
 };
 async function invoke(name, kind, output, throwRecording = false) {
@@ -126,7 +128,7 @@ test('actual paid assertion boundaries and all failure stages retain one accurat
       expect(observed.created).toEqual([]);
       if (kind === 'runner' || kind === 'fixture') {
         expect(observed.error).toBe(kind === 'runner' ? runnerError : fixtureError);
-        expect(observed.entry).toMatchObject({ exit_reason: 'harness_error', cost_usd: 0, model: CLAUDE_FRONTIER_EVAL_MODEL });
+        expect(observed.entry).toMatchObject({ exit_reason: 'harness_error', cost_usd: 0, model: CLAUDE_CAPTURE_EVAL_MODEL });
         expect(observed.entry.error).toContain('cost and usage unavailable');
         expect(observed.entry.transcript).toBeUndefined();
         expect(observed.runnerCalls).toBe(kind === 'runner' ? 1 : 0);
@@ -147,14 +149,26 @@ test('actual paid assertion boundaries and all failure stages retain one accurat
   // An unavailable-option explanation remains a passing attempt; only a real
   // consent offer is forbidden by the updated contract assertion.
   const narration = await invoke('tpa-absent-darwin', 'pass',
-    'Download it at aside.com (macOS 15+). Driving in your Aside browser is unavailable.');
+    '> Download Aside (macOS 15+) at aside.com; open, sign in, re-run. Driving in your Aside browser is unavailable.');
   expect(narration.failed).toBe(false);
   expect(narration.entry.passed).toBe(true);
   expect(narration.recordCalls).toBe(1);
+  for (const response of recoveryResponses) {
+    for (const [output, passed] of [
+      [response.text, true],
+      [response.text.replace('option included.', 'option included; then I drive in your Aside browser.'), false],
+    ]) {
+      const observed = await invoke('tpa-broken', 'pass', output);
+      expect(observed.failed).toBe(!passed);
+      expect(observed.entry.passed).toBe(passed);
+      expect(observed.recordCalls).toBe(1);
+      expect(observed.entry.transcript).toEqual(observed.result.transcript);
+    }
+  }
   // A runner/setup exception has no returned model. Mirror the same capture
   // resolution that the real session runner would have used, including overrides.
   for (const [overrides, expected] of [
-    [{}, CLAUDE_FRONTIER_EVAL_MODEL],
+    [{}, CLAUDE_CAPTURE_EVAL_MODEL],
     [{ GSTACK_EVAL_MODEL: 'global-model' }, 'global-model'],
     [{ GSTACK_EVAL_MODEL: 'global-model', GSTACK_EVAL_MODEL_CAPTURE: 'capture-model' }, 'capture-model'],
     [{ GSTACK_EVAL_MODEL: 'global-model', GSTACK_EVAL_MODEL_CAPTURE: 'capture-model', EVALS_MODEL: 'evals-model' }, 'evals-model'],
@@ -244,6 +258,6 @@ test('actual paid assertion boundaries and all failure stages retain one accurat
 test('TPA records the real paid case outcome once after all existing assertions', async () => {
   const observed = await exerciseCases();
   expect(observed.code, observed.output).toBe(0);
-  expect(observed.facts).toHaveLength(39);
+  expect(observed.facts).toHaveLength(43);
   expect(observed.facts.filter((entry: any) => entry.passed)).toHaveLength(5);
 }, 20_000);

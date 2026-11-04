@@ -37,6 +37,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { resolveClaudeBinary as resolveClaudeBinaryShared } from '../../lib/claude-bin';
 import { resolveEvalModel } from '../../lib/eval-model';
+import { streamedUsageCostUsd } from '../../lib/pricing';
+import { sdkSystemPrompt, type SystemPromptOption } from './sdk-system-prompt';
+import { SessionObserver, appendSessionLedger, sessionKey, type SessionEnd } from './session-ledger';
 import { hermeticChildEnv } from './hermetic-env';
 import type { SkillTestResult } from './session-runner';
 
@@ -73,18 +76,15 @@ export interface AgentSdkResult {
 /** Signature matching `query()` from the SDK. DI hook for unit tests. */
 export type QueryProvider = typeof query;
 
-/** Subset of SDK Options['systemPrompt'] we support. */
-export type SystemPromptOption =
-  | string
-  | { type: 'preset'; preset: 'claude_code'; append?: string; excludeDynamicSections?: boolean };
+export type { SystemPromptOption };
 
 export interface RunAgentSdkOptions {
   /**
-   * System prompt surface.
-   *   - bare string "" -> omit entirely (SDK default: no system prompt)
-   *   - bare string "...text..." -> REPLACE default with given text (use sparingly)
+   * System prompt surface (test/helpers/sdk-system-prompt.ts).
    *   - { type:'preset', preset:'claude_code' } -> use Claude Code default
    *   - { type:'preset', preset:'claude_code', append: "..." } -> default + append
+   *   - { type:'sdk-default', reason } -> omit; the SDK runs its bare stub
+   *   - { type:'custom', text, reason } -> REPLACE default with given text
    *
    * For overlay-efficacy measurement, the preset+append pattern is the right
    * one: it measures "does adding overlay text to the REAL Claude Code system
@@ -108,6 +108,7 @@ export interface RunAgentSdkOptions {
   queryProvider?: QueryProvider;
   /** Cancel queueing, SDK work and retries under the caller's case deadline. */
   signal?: AbortSignal;
+  onAdmission?: () => void;
   /** Max 429 retries per call. Default 3. */
   maxRetries?: number;
   /**
@@ -129,6 +130,10 @@ export interface RunAgentSdkOptions {
    * to auto-allow them.
    */
   canUseTool?: CanUseTool;
+  /** A custom queryProvider that drops `stream_event` rows from its own evidence opts in to partial messages. */
+  streamLiveness?: boolean;
+  /** The session timeout the caller armed (a getter when armed at admission), for the session ledger. */
+  sessionBudgetMs?: number | (() => number | undefined);
 }
 
 /**
@@ -310,6 +315,7 @@ export async function runAgentSdkTest(
   opts: RunAgentSdkOptions,
 ): Promise<AgentSdkResult> {
   const sem = getApiSemaphore();
+  const systemPrompt = sdkSystemPrompt(opts.systemPrompt);
   const maxRetries = opts.maxRetries ?? 3;
   const queryImpl: QueryProvider = opts.queryProvider ?? query;
   // Default matches session-runner's frontier eval fallback. Tests that need a
@@ -330,10 +336,30 @@ export async function runAgentSdkTest(
 
   let attempt = 0;
   let lastErr: unknown = null;
+  let admitted = false;
 
   while (attempt <= maxRetries) {
     await sem.acquire(opts.signal);
     const startMs = Date.now();
+    const startMono = performance.now();
+    const startedAt = new Date().toISOString();
+    const observer = new SessionObserver(startMono);
+    let recorded = false;
+    /** One ledger row per attempt; an abort at the armed budget is a session timeout. */
+    const recordSession = (fallback: SessionEnd) => {
+      if (recorded) return;
+      recorded = true;
+      const elapsed = performance.now() - startMono;
+      const budget = typeof opts.sessionBudgetMs === 'function' ? opts.sessionBudgetMs() : opts.sessionBudgetMs;
+      const aborted = controller.signal.aborted || opts.signal?.aborted === true;
+      const structured = observer.verdict();
+      const streamed = observer.billed ? undefined : streamedUsageCostUsd(assistantTurns, model);
+      const end: SessionEnd = aborted ? (budget !== undefined && elapsed + 1000 >= budget ? 'session_timeout' : 'aborted') : structured?.end ?? fallback;
+      appendSessionLedger({ key: sessionKey('agent-sdk', opts.testName), ...(opts.testName ? { test_name: opts.testName } : {}), runner: 'agent-sdk',
+        started_at: startedAt, ...(budget !== undefined ? { budget_ms: budget } : {}), elapsed_ms: elapsed, end,
+        ...(end === 'session_timeout' ? { evidence: `armed ${budget}ms session timeout fired` } : structured && !aborted ? { evidence: structured.evidence } : {}),
+        liveness: observer.summary(performance.now()), billed: observer.billed, ...(streamed !== undefined ? { streamed_cost_usd: streamed } : {}) });
+    };
     const controller = new AbortController();
     let activeQuery: ReturnType<QueryProvider> | undefined;
     const abort = () => {
@@ -356,7 +382,7 @@ export async function runAgentSdkTest(
     let terminalResult: SDKResultMessage | null = null;
     // A generator can emit its terminal result and then throw. Keep its
     // authoritative usage in both paths, while preserving the caller's outcome.
-    const finishResult = (exitReason: string): AgentSdkResult => ({
+    const finishResult = (exitReason: string): AgentSdkResult => (recordSession(exitReason === 'success' ? 'completed' : 'error'), {
       events,
       assistantTurns,
       toolCalls,
@@ -376,6 +402,10 @@ export async function runAgentSdkTest(
 
     try {
       opts.signal?.throwIfAborted();
+      if (!admitted) {
+        admitted = true;
+        opts.onAdmission?.();
+      }
       // When canUseTool is supplied, the SDK must route tool-use approval
       // decisions through the callback. bypassPermissions short-circuits
       // that. Flip to 'default' mode so canUseTool actually fires. Tests
@@ -407,14 +437,17 @@ export async function runAgentSdkTest(
         settingSources: opts.settingSources ?? [],
         env: hermeticChildEnv(opts.env),
         pathToClaudeCodeExecutable: opts.pathToClaudeCodeExecutable,
-        ...(hasCanUseTool ? { canUseTool: opts.canUseTool } : {}),
+        // Liveness only: stream_event rows are observed, never kept in events. A custom
+        // queryProvider sees every row first, so it streams them only when it opts in.
+        includePartialMessages: !opts.queryProvider || opts.streamLiveness === true,
+        ...(hasCanUseTool ? { canUseTool: async (...args: Parameters<CanUseTool>) => {
+          observer.permission(1);
+          try { return await opts.canUseTool!(...args); } finally { observer.permission(-1); }
+        } } : {}),
       };
-      // Empty bare string means "omit entirely" (SDK runs with no override).
-      // Any object or non-empty string is passed through.
-      if (typeof opts.systemPrompt === 'object' || opts.systemPrompt !== '') {
-        sdkOpts.systemPrompt = opts.systemPrompt;
-      }
+      Object.assign(sdkOpts, systemPrompt);
 
+      opts.signal?.throwIfAborted();
       const q = queryImpl({
         prompt: opts.userPrompt,
         options: sdkOpts,
@@ -424,7 +457,9 @@ export async function runAgentSdkTest(
       opts.signal?.throwIfAborted();
 
       for await (const ev of q) {
+        observer.observe(ev, performance.now());
         opts.signal?.throwIfAborted();
+        if (ev.type === 'stream_event') continue;
         const now = Date.now();
         if (firstResponseMs === 0) firstResponseMs = now - startMs;
         const interTurn = now - lastEventMs;
@@ -487,6 +522,7 @@ export async function runAgentSdkTest(
       return finishResult(terminalResult.subtype ?? 'unknown');
     } catch (err) {
       lastErr = err;
+      if (!isMaxTurnsError(err)) recordSession('error');
       opts.signal?.throwIfAborted();
 
       // Some SDK versions throw max-turns after emitting a terminal result;

@@ -10,7 +10,7 @@ import { Database } from 'bun:sqlite';
 import { dlopen, FFIType, ptr } from 'bun:ffi';
 import { nativeBrowserPaths } from '../src/cookie-import-native';
 import { NATIVE_BROWSER_VERSION_COMMAND } from '../src/cookie-import-native-integrity';
-import { createNativeCookieJob, joinNativeCookieJob, NativeCookieJobError, nativeCookieDiagnostic, parseNativeCookieDiagnostic, type NativeCookieJob } from '../src/cookie-import-native-job';
+import { createNativeCookieJob, joinNativeCookieJob, NATIVE_CLEANUP_MS, NativeCookieJobError, nativeCookieDiagnostic, parseNativeCookieDiagnostic, type NativeCookieJob } from '../src/cookie-import-native-job';
 import { nativeCookieEnvironment, NATIVE_COOKIE_NODE_SCRIPT, superviseNativeCookieImport, type NativeCookieMember, type NativeCookieReply, type NativeCookieRequest } from '../src/cookie-import-native-worker';
 import { decodeNativeCommandLine } from './fixtures/native-cookie-process-observer';
 import { createFixtureDeleteLease, FixtureDeleteError } from './fixtures/native-cookie-delete-lease';
@@ -283,10 +283,27 @@ function clearOwnedFixtureContents(fixture: string, identity: { path: string; de
   }
 }
 
+function removeOwnedFixtureRootWithNode(directory: string, identity: { path: string; dev: bigint; ino: bigint }): void {
+  const node = Bun.which('node');
+  if (!node) throw new Error('Node is required for native fixture cleanup');
+  const result = spawnSync(node, [path.resolve(import.meta.dir, 'fixtures/native-cookie-remove-fixture.cjs'), Buffer.from(JSON.stringify({
+    root: directory, realpath: identity.path, dev: identity.dev.toString(), ino: identity.ino.toString(),
+  })).toString('base64')], { env: nativeCookieEnvironment(process.env), encoding: 'utf8', timeout: 5_000, windowsHide: true, maxBuffer: 65536 });
+  let receipt: { removed?: boolean; code?: string };
+  try { receipt = JSON.parse(result.stdout); }
+  catch { receipt = { removed: false }; }
+  if (result.status === 0 && receipt?.removed === true && !existsSync(directory)) return;
+  throw Object.assign(new Error('Native fixture root cleanup failed'), {
+    code: receipt?.code || 'EIO', syscall: 'rm', path: directory,
+    receipt: { ...receipt, exitCode: result.status },
+  });
+}
+
 afterAll(() => {
   try {
     if (existsSync(root) && realpathSync(root) !== resolvedRoot) throw new Error('Native fixture root ownership changed');
-    rmSync(root, { recursive: true, force: true });
+    if (process.platform === 'win32') removeOwnedFixtureRootWithNode(root, { path: resolvedRoot, dev: initialRootState.dev, ino: initialRootState.ino });
+    else rmSync(root, { recursive: true, force: true });
   } catch (error) {
     console.error(JSON.stringify({ nativeFixtureRemovalFailure: { stage: 'after_all', ...fixtureRemovalEvidence(error, root, initialRootState) } }));
     const entries: { path: string; type: string; mode?: number; code?: string }[] = [];
@@ -310,21 +327,14 @@ afterAll(() => {
     }
     const lockedFile = entries.find(entry => entry.type === 'file' && /^[0-9a-f-]{36}\.tmp$/i.test(path.basename(entry.path)));
     console.error(JSON.stringify({ nativeFixtureCleanup: { code: (error as NodeJS.ErrnoException).code, pendingChildCloses: fixtureChildren.size, rootVerified, rootMode, remaining: entries,
+      ...(error && typeof error === 'object' && 'receipt' in error ? { nodeCleanup: error.receipt } : {}),
       fileOwners: lockedFile ? { file: lockedFile.path, owners: fixtureFileOwners(path.join(root, lockedFile.path)) } : undefined,
     } }));
-    const node = Bun.which('node');
-    if (rootVerified && node) {
-      const comparison = spawnSync(node, [path.resolve(import.meta.dir, 'fixtures/native-cookie-remove-fixture.cjs'), Buffer.from(JSON.stringify({
-        root, realpath: resolvedRoot, dev: initialRootState.dev.toString(), ino: initialRootState.ino.toString(),
-      })).toString('base64')], { env: nativeCookieEnvironment(process.env), encoding: 'utf8', timeout: 5_000, windowsHide: true, maxBuffer: 65536 });
-      let evidence: object;
-      try { evidence = JSON.parse(comparison.stdout); }
-      catch { evidence = { removed: false, reason: 'node_cleanup_no_receipt', exitCode: comparison.status }; }
-      console.error(JSON.stringify({ nativeFixtureNodeCleanupComparison: evidence }));
-    }
     throw error;
   }
 }, 15_000);
+
+const NATIVE_SUPERVISOR_MS = 25_000 + NATIVE_CLEANUP_MS;
 
 const request: NativeCookieRequest = {
   nodeExecutable: 'C:\\fixture\\node.exe',
@@ -335,12 +345,14 @@ const request: NativeCookieRequest = {
   profile: 'Default',
   domains: ['example.test'],
   deadline: 25_000,
-  qualifiedBunVersions: ['1.4.0'],
+  qualifiedBunVersions: ['1.4.2'],
 };
 
 function kernelContract(mode: string) {
   const script = `
     const calls = [];
+    const polls = {};
+    let listings = 0;
     globalThis.__nativeCookieFfi = {
       FFIType: { ptr: 'ptr', u64: 'u64', u32: 'u32', i32: 'i32' },
       ptr: buffer => buffer,
@@ -350,8 +362,18 @@ function kernelContract(mode: string) {
           CreateJobObjectW: (security, name) => { calls.push(['create', security, name.toString('utf16le')]); return 42; },
           OpenJobObjectW: (access, inherit, name) => { calls.push(['open', access, inherit, name.toString('utf16le')]); return 42; },
           SetInformationJobObject: (handle, kind, buffer, length) => { calls.push(['limits', handle, kind, length, buffer.readUInt32LE(16)]); return 1; },
-          QueryInformationJobObject: (handle, kind, buffer, length) => { calls.push(['query', handle, kind, length]); buffer.writeUInt32LE(3, 40); return 1; },
-          OpenProcess: (access, inherit, pid) => { calls.push(['open-process', access, inherit, pid === process.pid]); return 999; },
+          QueryInformationJobObject: (handle, kind, buffer, length) => {
+            calls.push(['query', handle, kind, length]);
+            if (kind === 1) buffer.writeUInt32LE(${mode === 'exiting' ? 0 : 3}, 40);
+            if (kind === 3 && ${JSON.stringify(mode)} === 'exiting' && listings++ === 0) {
+              buffer.writeUInt32LE(3, 4);
+              [101, 102, 103].forEach((pid, index) => buffer.writeBigUInt64LE(BigInt(pid), 8 + 8 * index));
+            }
+            return 1;
+          },
+          OpenProcess: (access, inherit, pid) => { calls.push(['open-process', access, inherit, pid === process.pid]); return ${mode === 'exiting' ? '1000 + pid' : 999}; },
+          IsProcessInJob: (member, job, result) => { calls.push(['in-job', member, job]); result.writeInt32LE(member === 1103 ? 0 : 1, 0); return 1; },
+          WaitForSingleObject: (member, milliseconds) => { calls.push(['wait', member, milliseconds]); polls[member] ??= member - 1100; return polls[member]-- > 0 ? 0x102 : 0; },
           AssignProcessToJobObject: (job, process) => { calls.push(['assign', job, process]); return ${mode === 'join-fail' ? 0 : 1}; },
           TerminateJobObject: (job, code) => { calls.push(['terminate', job, code]); return 1; },
           CloseHandle: handle => { calls.push(['close', handle]); return 1; },
@@ -370,6 +392,11 @@ function kernelContract(mode: string) {
       const active = job.activeProcesses();
       job.terminate(); job.close(); job.close();
       console.log(JSON.stringify({ name: job.name, active, calls }));
+    } else if (${JSON.stringify(mode)} === 'exiting') {
+      const job = await createNativeCookieJob();
+      const active = [job.activeProcesses(), job.activeProcesses(), job.activeProcesses()];
+      job.close();
+      console.log(JSON.stringify({ active, calls }));
     } else {
       let error, diagnostic;
       try { await joinNativeCookieJob('Local\\\\gstack-cookie-12345678-1234-1234-1234-123456789abc'); } catch (caught) { error = caught.message; diagnostic = caught.diagnostic; }
@@ -406,6 +433,15 @@ describe('production Windows Job Object API contract', () => {
     expect(result.calls).toContainEqual(['query', 42, 1, 48]);
     expect(result.calls).toContainEqual(['terminate', 42, 1]);
     expect(result.calls.filter((call: unknown[]) => call[0] === 'close')).toEqual([['close', 42]]);
+  });
+
+  test('a member the Job no longer counts stays active until its process handle signals exit', () => {
+    const result = kernelContract('exiting');
+    expect(result.active).toEqual([2, 1, 0]);
+    expect(result.calls).toContainEqual(['query', 42, 3, 8 + 8 * 1024]);
+    expect(result.calls).toContainEqual(['open-process', 0x00101000, 0, false]);
+    expect(result.calls.filter((call: unknown[]) => call[0] === 'in-job')).toEqual([['in-job', 1101, 42], ['in-job', 1102, 42], ['in-job', 1103, 42]]);
+    expect(result.calls.filter((call: unknown[]) => call[0] === 'close')).toEqual([['close', 1103], ['close', 1101], ['close', 1102], ['close', 42]]);
   });
 
   test('member assigns its own handle, never a discovered PID', () => {
@@ -826,6 +862,44 @@ describe('owned native-cookie lifecycle', () => {
     expect(existsSync(root)).toBe(true);
   }, 15_000);
 
+  test('native root teardown rejects a changed identity and removes nested owned contents', () => {
+    const fixture = mkdtempSync(path.join(root, 'root-cleanup-'));
+    const state = lstatSync(fixture, { bigint: true });
+    const identity = { path: realpathSync(fixture), dev: state.dev, ino: state.ino };
+    const marker = path.join(fixture, 'nested', 'marker');
+    mkdirSync(path.dirname(marker));
+    writeFileSync(marker, 'fixture-only');
+    expect(() => removeOwnedFixtureRootWithNode(fixture, { ...identity, ino: identity.ino + 1n })).toThrow('Native fixture root cleanup failed');
+    expect(readFileSync(marker, 'utf8')).toBe('fixture-only');
+    removeOwnedFixtureRootWithNode(fixture, identity);
+    expect(existsSync(fixture)).toBe(false);
+  });
+
+  test.skipIf(process.platform !== 'win32')('native root teardown refuses a real delete-sharing lock until its owner closes', () => {
+    const fixture = mkdtempSync(path.join(root, 'root-lock-'));
+    const identity = lstatSync(fixture, { bigint: true });
+    const file = path.join(fixture, 'held.tmp');
+    writeFileSync(file, 'fixture-only');
+    const kernel = dlopen('kernel32.dll', {
+      CreateFileW: { args: [FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.u64], returns: FFIType.u64 },
+      CloseHandle: { args: [FFIType.u64], returns: FFIType.i32 },
+    });
+    const name = Buffer.from(file + '\0', 'utf16le');
+    const handle = kernel.symbols.CreateFileW(ptr(name), 0x80000000, 3, null, 3, 0x80, 0);
+    try {
+      expect(BigInt(handle)).not.toBe(0xffffffffffffffffn);
+      expect(BigInt(handle)).not.toBe(0n);
+      expect(() => removeOwnedFixtureRootWithNode(fixture, { path: realpathSync(fixture), dev: identity.dev, ino: identity.ino })).toThrow('Native fixture root cleanup failed');
+      expect(readFileSync(file, 'utf8')).toBe('fixture-only');
+    } finally {
+      try {
+        if (BigInt(handle) !== 0xffffffffffffffffn && BigInt(handle) !== 0n) expect(kernel.symbols.CloseHandle(handle)).toBe(1);
+      } finally { kernel.close(); }
+    }
+    removeOwnedFixtureRootWithNode(fixture, { path: realpathSync(fixture), dev: identity.dev, ino: identity.ino });
+    expect(existsSync(fixture)).toBe(false);
+  }, 15_000);
+
   test('success is withheld until the entire job is empty and member exits', async () => {
     const run = simulation({ reply: { cookies: [] }, exitAt: 200 });
     expect(await run.run).toEqual({ cookies: [] });
@@ -875,10 +949,36 @@ describe('owned native-cookie lifecycle', () => {
     expect(now).toBeLessThan(30_000);
   });
 
+  test('cleanup waits for a member that is still exiting after the Job count reads zero', async () => {
+    let now = 0;
+    let held = false;
+    let settleReply!: (reply: NativeCookieReply) => void;
+    let settleClose!: () => void;
+    const result = await superviseNativeCookieImport(request, {
+      now: () => now,
+      sleep: async milliseconds => {
+        now += milliseconds;
+        if (now >= 20) settleReply({ cookies: [] });
+        if (now >= 200) settleClose();
+      },
+      createJob: async () => ({
+        name: 'synthetic-owned-job', close() {}, terminate() {},
+        activeProcesses: () => {
+          if (now < 100) held = true;
+          return now < 100 || (held && now < 5_000) ? 1 : 0;
+        },
+      }),
+      startMember: () => ({ result: new Promise(resolve => { settleReply = resolve; }), closed: new Promise(resolve => { settleClose = resolve; }), stop() {} }),
+    });
+    expect(result).toEqual({ cookies: [] });
+    expect(now).toBeGreaterThanOrEqual(5_000);
+    expect(now).toBeLessThan(NATIVE_CLEANUP_MS);
+  });
+
   test('unconfirmed termination is reported as cleanup failure, never success', async () => {
     const run = simulation({ retainAfterTerminate: true });
     expect(await run.run).toEqual({ error: 'native_cleanup_failed' });
-    expect(run.state()).toMatchObject({ time: 30_000, terminated: 1, stopped: 1, jobClosed: 1 });
+    expect(run.state()).toMatchObject({ time: 25_000 + NATIVE_CLEANUP_MS, terminated: 1, stopped: 1, jobClosed: 1 });
   });
 
   test('a process crash cannot strand remaining members', async () => {
@@ -953,9 +1053,9 @@ function safeNativeEnvelope(output: string): object {
 
 function assertOwnerReceipt(receipt: { available: boolean; owners: { pid: number; creationMatched: boolean; isTestHost: boolean }[] }, pid: number) {
   const before = JSON.stringify(receipt);
-  expect(receipt.available).toBe(true);
-  expect(Array.isArray(receipt.owners)).toBe(true);
-  expect(receipt.owners.some(owner => owner.pid === pid && owner.creationMatched && owner.isTestHost)).toBe(true);
+  expect(receipt.available, before).toBe(true);
+  expect(Array.isArray(receipt.owners), before).toBe(true);
+  expect(receipt.owners.some(owner => owner.pid === pid && owner.creationMatched && owner.isTestHost), before).toBe(true);
   expect(JSON.stringify(receipt)).toBe(before);
 }
 
@@ -983,11 +1083,11 @@ function safeLaunchEvidence(file: string): object {
 }
 
 function nativeSupervisor(input: NativeCookieRequest, env: NodeJS.ProcessEnv) {
-  const cleanupDeadline = performance.now() + 30_000;
+  const cleanupDeadline = performance.now() + NATIVE_SUPERVISOR_MS;
   const child = ownFixtureChild(spawn(process.execPath, ['--no-env-file', '--no-install', '--no-macros', '--config=NUL', path.resolve(import.meta.dir, '../src/cookie-import-native-worker.ts')], { env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true }));
   let output = '';
   child.stdout.on('data', chunk => { output += chunk; });
-  const timer = setTimeout(() => child.kill(), 30_000);
+  const timer = setTimeout(() => child.kill(), NATIVE_SUPERVISOR_MS);
   const done = new Promise<NativeCookieReply>((resolve, reject) => {
     child.once('error', reject);
     child.once('close', () => {
@@ -1000,6 +1100,29 @@ function nativeSupervisor(input: NativeCookieRequest, env: NodeJS.ProcessEnv) {
   child.stdin.write(JSON.stringify({ ...input, deadline: Date.now() + 25_000, qualifiedBunVersions: [Bun.version] }) + '\n');
   return { child, done, cleanupDeadline, envelope: () => safeNativeEnvelope(output) };
 }
+
+async function waitForNativeOwnerMarker(marker: string, done: Promise<NativeCookieReply>): Promise<boolean> {
+  let finished = false;
+  void done.then(() => { finished = true; }, () => { finished = true; });
+  while (!finished && !existsSync(marker)) await Bun.sleep(20);
+  return existsSync(marker) && !finished;
+}
+
+test('held owner readiness follows its marker or terminal reply, not an earlier checkpoint', async () => {
+  const fixture = mkdtempSync(path.join(root, 'owner-readiness-'));
+  const marker = path.join(fixture, 'ready');
+  let finish!: (reply: NativeCookieReply) => void;
+  const done = new Promise<NativeCookieReply>(resolve => { finish = resolve; });
+  let observed = false;
+  const waiting = waitForNativeOwnerMarker(marker, done).then(ready => { observed = true; return ready; });
+  await Bun.sleep(50);
+  expect(observed).toBe(false);
+  writeFileSync(marker, 'fixture-only', { flag: 'wx' });
+  expect(await waiting).toBe(true);
+  finish({ error: 'native_timeout' });
+  expect(await waitForNativeOwnerMarker(path.join(fixture, 'missing'), Promise.resolve({ error: 'native_failed' }))).toBe(false);
+  expect(await waitForNativeOwnerMarker(path.join(fixture, 'missing'), Promise.reject(new Error('fixture-only')))).toBe(false);
+});
 
 describe('native Windows process qualification', () => {
   test.skipIf(process.platform !== 'win32' || process.env.GSTACK_COOKIE_NATIVE_DEFAULT_FIXTURE !== '1')('an exclusively created default Edge profile persists v20 and reimports it through the owned Node worker', async () => {
@@ -1062,7 +1185,7 @@ describe('native Windows process qualification', () => {
       }
       for (const parent of createdParents.reverse()) rmdirSync(parent);
     }
-  }, 65_000);
+  }, 2 * NATIVE_SUPERVISOR_MS + 5_000);
 
   test.skipIf(process.platform !== 'win32')('a locked real Edge profile leaves its existing owner alive', async () => {
     const node = Bun.which('node');
@@ -1070,38 +1193,26 @@ describe('native Windows process qualification', () => {
     if (!node || !edge) throw new Error('Native qualification requires Node and installed Microsoft Edge');
     const fixture = mkdtempSync(path.join(root, 'locked-edge-'));
     const marker = path.join(fixture, 'owner-ready.json');
+    const ownerObservation = path.join(fixture, 'owner-launch.json');
     const contenderObservation = path.join(fixture, 'contender-launch.json');
     const contenderEntry = path.join(fixture, 'contender-playwright.cjs');
     const playwrightEntry = path.join(fixture, 'held-playwright.cjs');
     const require = createRequire(import.meta.url);
     writeFileSync(contenderEntry, `module.exports = require(${JSON.stringify(path.resolve(import.meta.dir, 'fixtures/native-cookie-launch.cjs'))})(${JSON.stringify({ observation: contenderObservation, playwrightEntry: require.resolve('playwright') })});`);
-    writeFileSync(playwrightEntry, `
-      const cp = require('node:child_process');
-      const spawn = cp.spawn;
-      let pid;
-      cp.spawn = function(command, args, options) {
-        if (args.some(arg => /^--(?:no-sandbox|disable-setuid-sandbox)(?:=|$)/.test(arg))) throw new Error('Native owner fixture refuses a sandbox-disabled browser');
-        const child = spawn.call(this, command, args, options); pid = child.pid; return child;
-      };
-      const { chromium } = require(${JSON.stringify(require.resolve('playwright'))});
-      exports.chromium = { async launchPersistentContext(root, options) {
-        const context = await chromium.launchPersistentContext(root, options);
-        require('node:fs').writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ pid }));
-        context.cookies = () => new Promise(() => {});
-        return context;
-      } };
-    `);
+    writeFileSync(playwrightEntry, `module.exports = require(${JSON.stringify(path.resolve(import.meta.dir, 'fixtures/native-cookie-launch.cjs'))})(${JSON.stringify({ observation: ownerObservation, playwrightEntry: require.resolve('playwright'), mode: 'held-owner', marker })});`);
     const env = nativeFixtureEnvironment(fixture, node);
     const input = { ...request, nodeExecutable: node, executablePath: edge, userDataDir: path.join(fixture, 'User Data'), playwrightEntry };
     const owner = nativeSupervisor(input, env);
     let contender: ReturnType<typeof nativeSupervisor> | undefined;
     try {
-      const readyBy = Date.now() + 10_000;
-      while (!existsSync(marker) && Date.now() < readyBy) await Bun.sleep(20);
-      expect({ ready: existsSync(marker), reply: owner.envelope() }).toMatchObject({ ready: true });
+      const ready = await waitForNativeOwnerMarker(marker, owner.done);
+      expect({ ready, reply: owner.envelope(), launch: safeLaunchEvidence(ownerObservation), ownerExitCode: owner.child.exitCode }).toMatchObject({ ready: true });
       const { pid } = JSON.parse(readFileSync(marker, 'utf8'));
+      const ownerLaunch = JSON.parse(readFileSync(ownerObservation, 'utf8'));
+      expect({ command: ownerLaunch.command, pid: ownerLaunch.pid, pipe: ownerLaunch.args?.includes('--remote-debugging-pipe') }).toEqual({ command: edge, pid, pipe: true });
+      expect(alive(pid)).toBe(true);
       contender = nativeSupervisor({ ...input, playwrightEntry: contenderEntry }, env);
-      expect({ result: await contender.done, launch: safeLaunchEvidence(contenderObservation) }).toMatchObject({ result: { error: 'browser_running' } });
+      expect({ result: await contender.done, launch: safeLaunchEvidence(contenderObservation) }).toMatchObject({ result: { error: 'browser_running' }, launch: { spawned: true, pipe: true } });
       expect(alive(pid)).toBe(true);
     } finally {
       contender?.child.kill();
@@ -1109,7 +1220,7 @@ describe('native Windows process qualification', () => {
       await contender?.done.catch(() => {});
       await owner.done.catch(() => {});
     }
-  }, 35_000);
+  }, 2 * NATIVE_SUPERVISOR_MS + 5_000);
 
   for (const mode of ['normal-close', 'stalled-close']) {
     test.skipIf(process.platform !== 'win32')(`real Edge synthetic profile: ${mode} returns only after the owned browser exits`, async () => {
@@ -1127,7 +1238,7 @@ describe('native Windows process qualification', () => {
       let output = '';
       supervisor.stdout.on('data', chunk => { output += chunk; });
       const started = Date.now();
-      const deadline = setTimeout(() => supervisor.kill(), 30_000);
+      const deadline = setTimeout(() => supervisor.kill(), NATIVE_SUPERVISOR_MS);
       supervisor.stdin.write(JSON.stringify({ ...request, nodeExecutable: node, playwrightEntry, executablePath: edge, userDataDir: path.join(fixture, 'User Data'), deadline: started + 25_000, qualifiedBunVersions: [Bun.version] }) + '\n');
       try {
         await closed;
@@ -1141,13 +1252,13 @@ describe('native Windows process qualification', () => {
         expect(browser.args.some((arg: string) => arg.startsWith('--remote-debugging-port'))).toBe(false);
         expect(browser.args.some((arg: string) => /^--(?:no-sandbox|disable-setuid-sandbox)(?:=|$)/.test(arg))).toBe(false);
         expect(alive(browser.pid)).toBe(false);
-        expect(Date.now() - started).toBeLessThan(30_000);
+        expect(Date.now() - started).toBeLessThan(NATIVE_SUPERVISOR_MS);
       } finally {
         clearTimeout(deadline);
         supervisor.kill();
         await closed;
       }
-    }, 35_000);
+    }, NATIVE_SUPERVISOR_MS + 5_000);
   }
 
   for (const mode of ['timeout', 'owner-exit', 'worker-crash']) {
@@ -1528,7 +1639,7 @@ describe('native Windows launch diagnostics', () => {
       expect(directObservation.observedCommandLine).toMatchObject({ available: true });
       expect(containedObservation.folderEvidence.directoriesAfterProbe).toEqual(containedObservation.folderEvidence.directoriesBefore);
       expect(directObservation.folderEvidence.directoriesAfterProbe).toEqual(directObservation.folderEvidence.directoriesBefore);
-    }, 65_000);
+    }, 2 * NATIVE_SUPERVISOR_MS + 5_000);
   }
 
   for (const state of ['preserved', 'fresh']) {
@@ -1583,6 +1694,6 @@ describe('native Windows launch diagnostics', () => {
       expect(secondObservation.observedCommandLine).toMatchObject({ available: true });
       expect('error' in second ? second.error : null).not.toBe('native_cleanup_failed');
       if (state === 'fresh') expect(firstObservation.folderEvidence.directoriesBefore).toEqual(secondObservation.folderEvidence.directoriesBefore);
-    }, 65_000);
+    }, 2 * NATIVE_SUPERVISOR_MS + 5_000);
   }
 });

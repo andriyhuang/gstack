@@ -29,7 +29,7 @@ function withFixture(check: (fixture: {
     fs.writeFileSync(path.join(home, '.gstack', 'config.yaml'), 'operator sentinel\n');
     const env = {
       PATH: process.env.PATH!, HOME: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp,
-      GSTACK_HOME: state, CONDUCTOR_WORKSPACE_PATH: project,
+      GSTACK_HOME: state, GSTACK_LEASE_DIR: path.join(tmp, 'gstack-leases'), CONDUCTOR_WORKSPACE_PATH: project,
       GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'),
     };
     execFileSync('git', ['init', '-b', 'main'], { cwd: project, env, stdio: 'pipe', timeout: 10_000 });
@@ -87,7 +87,7 @@ mock.module(path.join(root, 'test/helpers/claude-pty-runner.ts'), () => ({
     // the observer must declare its audit interface before any model starts.
     expect(fs.readFileSync(path.join(opts.cwd, 'PLAN.md'), 'utf8')).toBe(opts.initialPlanContent);
     expect(opts.initialPlanContent).toMatch(/full selected mode name[\\s\\S]*user_choice and recommended/);
-    expect(opts.initialPlanContent).toContain('public decision');
+    expect(opts.initialPlanContent).toContain("in the skill's\\nnormal mode handoff line");
     expect(opts.initialPlanContent).toContain('No review mode has\\nbeen selected.');
     expect(opts.initialPlanContent).not.toMatch(/HOLD SCOPE|SCOPE EXPANSION|SELECTIVE EXPANSION|SCOPE REDUCTION/);
     const run = (bin, args) => execFileSync(path.join(root, 'bin', bin), args, {

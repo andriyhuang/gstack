@@ -6,23 +6,62 @@ import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { describeE2ETier, e2eTierEnabled } from './helpers/e2e-gate';
 import { EvalCollector } from './helpers/eval-store';
 import {
-  fixtureWorkingTree, reviewLifecycleInstructions, reviewRevalidationPrompt, reviewRecords,
+  fixtureGit, fixtureWorkingTree, reviewLifecycleInstructions, reviewRevalidationPrompt, reviewRecords, SHARED_LIBS_ROOT,
   runSharedInteractive, toolCommandTrace, readRequests, SharedCaptureAccumulator, type SharedLibsFixture,
 } from './helpers/shared-libs-eval-fixture';
-import { preparePathEligibilityFixture, type PathEligibilityCase } from './helpers/shared-libs-path-fixture';
+import {
+  preparePathEligibilityFixture, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt, type PathEligibilityCase,
+} from './helpers/shared-libs-path-fixture';
+import { hasTrustedSharedLibsCheck } from './helpers/shared-libs-review-start-evidence';
 
 const describeE2E = describeE2ETier('gate');
 const collector = e2eTierEnabled('gate') ? new EvalCollector('e2e') : null;
 const captures = new SharedCaptureAccumulator();
 afterAll(async () => { await captures.finalize(collector); });
 
-function sourceReadTrace(result: any): string {
-  return result.toolCalls.flatMap((call: any) => {
-    if (call.tool === 'Read') return [String(call.input?.file_path || '')];
-    const command = String(call.input?.command || '');
-    if (call.tool === 'Bash' && /\b(?:cat|sed|head|tail|nl)\b|readFile|Bun\.file/.test(command)) return [command];
-    return [];
-  }).join('\n');
+function sourceReadTrace(result: any, fixture: SharedLibsFixture, sources: string[]): string {
+  const readInput = (tool: string, input: any): string => {
+    if (tool === 'Read') return String(input?.file_path || '');
+    const command = String(input?.command || '');
+    return tool === 'Bash' && /\b(?:cat|sed|head|tail|nl)\b|readFile|Bun\.file/.test(command) ? command : '';
+  };
+  const reads: string[] = result.toolCalls.map((call: any) => readInput(call.tool, call.input)).filter(Boolean);
+  const calls = new Map<string, { tool: string; read: string }>();
+  const returned: Array<{ tool: string; read: string; text: string }> = [];
+  for (const event of result.events ?? []) {
+    if (!Array.isArray(event.message?.content)) continue;
+    for (const block of event.message.content) {
+      if (event.type === 'assistant' && block.type === 'tool_use') {
+        const read = readInput(block.name, block.input);
+        if (read) calls.set(block.id, { tool: block.name, read });
+      }
+      if (event.type !== 'user' || block.type !== 'tool_result' || block.is_error === true) continue;
+      const call = calls.get(block.tool_use_id);
+      if (!call) continue;
+      const text = typeof block.content === 'string' ? block.content
+        : Array.isArray(block.content) ? block.content.filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n') : '';
+      returned.push({ ...call, text: text.replace(/^\s*\d+→/gm, '') });
+    }
+  }
+  if (!returned.length) return reads.join('\n');
+  const repo = fs.realpathSync(fixture.repo);
+  for (const source of sources) {
+    let resolved: string;
+    try { resolved = fs.realpathSync(path.resolve(repo, source)); }
+    catch { continue; }
+    const relative = path.relative(repo, resolved);
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+    if (resolved === path.resolve(repo, source)) continue;
+    const contents = fs.readFileSync(resolved, 'utf8');
+    if (!contents) continue;
+    const paths = [relative, resolved];
+    if (path.sep === '\\') paths.push(...paths.map(value => value.replaceAll('\\', '/')));
+    const spellings = paths.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const namedPath = new RegExp(`(?:^|[\\s"'=;])(?:\\./)?(?:${spellings.join('|')})(?=$|[\\s"';|)])`);
+    if (returned.some(({ tool, read, text }) => (tool === 'Read' ? path.resolve(repo, read) === resolved : namedPath.test(read))
+      && text.includes(contents))) reads.push(source);
+  }
+  return reads.join('\n');
 }
 
 async function exerciseEligibility(testId: string, kinds: PathEligibilityCase[]) {
@@ -38,33 +77,34 @@ async function exerciseEligibility(testId: string, kinds: PathEligibilityCase[])
       try {
         const prepared = preparePathEligibilityFixture(kind);
         f = prepared.fixture;
+        const prerequisites = checkPathReviewPrerequisites(f, prepared.resumed.input);
+        expect(prerequisites.settled, `${kind}: fixture prerequisites must be settled before capture`).toBe(true);
         const sourceBefore = new Map(prepared.current.evidence_paths.map((source: string) =>
           [source, fs.readFileSync(path.join(prepared.fixture.repo, source), 'utf8')]));
         const instructions = reviewLifecycleInstructions(f);
         const supplied = path.join(f.root, 'current-advisory.jsonl');
         fs.writeFileSync(supplied, JSON.stringify({ ...prepared.current, specialist: 'maintainability' }) + '\n');
-        const prompt = reviewRevalidationPrompt(f, instructions, supplied)
+        const prompt = reviewRevalidationPrompt(f, instructions, supplied, prepared.resumed)
           + '\nAll named caller sources are first-party authored runtime code. Inspect them directly, including any Git/path boundary, before deciding whether the previous review decision can be reused. The fixture contains no generated caller sources.';
-        const capture = await runSharedInteractive(f, testId, prompt, 'skip');
+        const capture = await runSharedInteractive(f, testId, prompt, 'skip', { attempt });
         result = capture.result;
         expect(result.exitReason, `${kind}: ${result.output}`).toBe('success');
         expect(result.toolCalls.length).toBeGreaterThan(0);
+        expect(checkPathReviewPrerequisites(f, prepared.resumed.input), `${kind}: prerequisite state must remain unchanged`).toEqual(prerequisites);
+        expect(hasPathReviewPrerequisiteReceipt(result.events ?? [], prepared.resumed.checkCommand, prerequisites),
+          `${kind}: consume current synthetic prerequisites before persistence`).toBe(true);
         expect(capture.questions.length, `${kind}: old decision must be revalidated and presented again`).toBeGreaterThan(0);
         const trace = toolCommandTrace(result).join('\n');
         expect(trace).toContain('gstack-review-read');
-        expect(trace).toContain('sharedLibsFingerprint');
         expect(trace).toContain('gstack-review-log');
         expect(trace).toContain('--start');
         expect(trace).toContain('--finish');
-        const reads = sourceReadTrace(result);
+        const reads = sourceReadTrace(result, f, prepared.sourcePaths);
         expect(reads).toContain('src/retry-worker.ts');
         expect(reads).toContain('lib/retry-after.ts');
         for (const source of prepared.sourcePaths) {
           expect(reads, `${kind}: reread ${source}`).toContain(source);
         }
-        if (kind === 'symlinks') expect(trace).toMatch(/readlink|lstat|stat\b|test\s+-L|\[\s+-L|ls-files[^\n]*(?:--stage|-s\b)/);
-        if (kind === 'submodule') expect(trace + '\n' + result.output).toMatch(/submodule|160000/i);
-        if (kind === 'ignored') expect(trace + '\n' + result.output).toMatch(/check-ignore|ignored|exclude-standard/i);
         expect(fixtureWorkingTree(f), `${kind}: Skip must not refactor any source`).toBe(prepared.beforeTree);
         for (const [source, before] of sourceBefore) {
           expect(fs.readFileSync(path.join(f.repo, source as string), 'utf8'), `${kind}: preserve raw ${source}`).toBe(before);
@@ -78,6 +118,22 @@ async function exerciseEligibility(testId: string, kinds: PathEligibilityCase[])
         expect(skipped.length, `${kind}: the new explicit decision must be saved`).toBeGreaterThan(0);
         expect(skipped.some((finding: any) => finding.helper_target?.path === 'lib/retry-after.ts'
           && finding.helper_target?.symbol === 'retrySeconds')).toBe(true);
+        if (trace.includes('--check-shared-libs')) {
+          expect(hasTrustedSharedLibsCheck(result.events ?? result.transcript ?? [], {
+            helper: path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log'),
+            repo: f.repo, state: f.state, slug: 'fixture-shared-libs',
+            directory: path.join(f.state, 'projects/fixture-shared-libs/.review-starts'),
+            branch: fixtureGit(f, 'symbolic-ref', '--quiet', '--short', 'HEAD'), wtree: fixtureWorkingTree(f),
+            startedAt: last.review_binding.started_at, finding: prepared.current, reusable: false,
+            sources: Object.fromEntries(sourceBefore),
+            coveredPaths: skipped.find((finding: any) => finding.fingerprint === prepared.current.fingerprint)?.snapshot_covered_paths,
+          })).toBe(true);
+        } else {
+          expect(trace).toContain('sharedLibsFingerprint');
+          if (kind === 'symlinks') expect(trace).toMatch(/readlink|lstat|stat\b|test\s+-L|\[\s+-L|ls-files[^\n]*(?:--stage|-s\b)/);
+          if (kind === 'submodule') expect(trace + '\n' + result.output).toMatch(/submodule|160000/i);
+          if (kind === 'ignored') expect(trace + '\n' + result.output).toMatch(/check-ignore|ignored|exclude-standard/i);
+        }
         for (const finding of skipped) {
           expect(finding.fingerprint).toMatch(/^shared-libs:[0-9a-f]{64}$/);
           expect(finding.evidence_paths).toContain('src/retry-worker.ts');
@@ -101,6 +157,7 @@ async function exerciseEligibility(testId: string, kinds: PathEligibilityCase[])
             duration_ms: result?.durationMs ?? 0, cost_usd: result?.costUsd ?? 0,
             model: result?.model, turns_used: result?.turnsUsed ?? 0,
             transcript: [{ scenario: kind, error: scenarioError, diagnostic: captureDiagnostic,
+              prerequisite_source: 'synthetic-fixture-input', prerequisite_native_coverage: false,
               cost_known: result?.costKnown, provider_requests: f ? readRequests(f) : [] }, ...(result?.events ?? [])],
             output: `[${kind}]${scenarioError ? ` ${scenarioError}` : ''}\n${result?.output ?? ''}`,
             error: scenarioError,

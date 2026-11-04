@@ -1,8 +1,12 @@
 import {expect,test,spyOn} from 'bun:test';
-import {buildPlanFloorReviewPrompt,validatePlanFloorAssessment,resolvePlanFloorCitations,judgePlanFloorReview,pickPlanFloorMode,pickPlanFloorProductType,type PlanFloorReview} from './helpers/plan-floor-review';
+import {buildPlanFloorReviewPrompt,validatePlanFloorAssessment,resolvePlanFloorCitations,judgePlanFloorReview,pickPlanFloorMode,pickPlanFloorProductType,PLAN_FLOOR_ASSESSMENT_CAP_MS,type PlanFloorReview} from './helpers/plan-floor-review';
 import {FORCING_FLOOR_CEO, FORCING_FLOOR_DEVEX} from './fixtures/forcing-finding-seeds';
 import capturedQuotes from './fixtures/plan-floor-quote-70b.json';
 import productTypes from './fixtures/plan-floor-product-type-70b.json';
+import narrativeConfirmation from './fixtures/devex-narrative-confirmation-36641820398.json';
+import partlyWrongNarrative from './fixtures/devex-narrative-confirmation-36794871032.json';
+import sdkCallTarget from './fixtures/devex-tthw-sdk-call-opus.json';
+import { expectMentions } from './helpers/prompt-structure';
 const review = ():PlanFloorReview=>({seed:FORCING_FLOOR_CEO,candidate:{transport:'native',identity:'owned:call:question:0',question:{
   header:'Evidence',question:'Pricing is assumed to block adoption without developer interviews. Should we test that premise before launch?',multiSelect:false,
   options:[{label:'Interview developers',description:'Validate pricing as a barrier before changing the tier.'},{label:'Ship the tier',description:'Launch using the current untested premise.'}],
@@ -15,7 +19,7 @@ test('complete native payload and seed reach the assessor without a fabricated a
  const input=review(),prompt=buildPlanFloorReviewPrompt(input);
  expect(prompt.endsWith(JSON.stringify(input))).toBe(true);
  expect(prompt).toContain('No answer has been supplied');
- expect(prompt).toContain('Mentioning a real problem within a setup question does not make it a finding');
+ expectMentions(prompt, [['does not', 'mentioning', 'question']], 'prompt');
  expect(JSON.parse(prompt.slice(prompt.indexOf('Evidence JSON:\n')+15))).toEqual(input);
  expect(validatePlanFloorAssessment(input,finding())).toEqual(finding());
 });
@@ -55,14 +59,15 @@ test('large complete input is preserved; over-limit input is rejected without in
  expect(()=>judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,invoke:(()=>{calls++;throw Error('must not execute');}) as any})).toThrow();
  expect(calls).toBe(0);
 });
-test('replacement judge retains the original CLI model, one turn, 30s cap and absolute case deadline',()=>{
- for(const remaining of [5000,60_000]){
+test('replacement judge retains the original CLI model, one turn, measured cap and absolute case deadline',()=>{
+ expect(PLAN_FLOOR_ASSESSMENT_CAP_MS).toBeGreaterThan(30_000);
+ for(const remaining of [5000,60_000,PLAN_FLOOR_ASSESSMENT_CAP_MS+60_000]){
   const deadlineAt=Date.now()+remaining;let calls=0;
   const actual=judgePlanFloorReview(review(),{binary:'/fake/claude',model:'unchanged-warmup',deadlineAt,invoke:((file,args,opts)=>{
    calls++;expect(file).toBe('/fake/claude');expect(args).toEqual(['-p','--model','unchanged-warmup','--max-turns','1']);
    expect(opts.stdio).toEqual(['pipe','pipe','pipe']);expect(opts.encoding).toBe('utf8');
    expect(opts.input).toBe(buildPlanFloorReviewPrompt(review()));
-   expect(opts.timeout).toBeGreaterThan(0);expect(opts.timeout).toBeLessThanOrEqual(Math.min(30_000,remaining));
+   expect(opts.timeout).toBeGreaterThan(0);expect(opts.timeout).toBeLessThanOrEqual(Math.min(PLAN_FLOOR_ASSESSMENT_CAP_MS,remaining));
    return {status:0,stdout:JSON.stringify(citationFinding()),stderr:''};
   }) as any});expect(calls).toBe(1);expect(actual.kind).toBe('finding');
  }
@@ -94,6 +99,29 @@ test.each([
  expect(actual).toMatchObject({kind:'setup',seedQuote:'',questionQuote:'',optionIndex:null,optionQuote:''});
  expect(calls).toBe(0);
 });
+const capturedNarrative = ():PlanFloorReview=>structuredClone(narrativeConfirmation.review) as PlanFloorReview;
+test.each([
+ ['some wrong',()=>capturedNarrative()],
+ ['partly wrong',()=>structuredClone(partlyWrongNarrative.review) as PlanFloorReview],
+] as const)('captured 0B narrative confirmation (%s) is setup without launching the assessor',(_label,capture)=>{
+ const input=capture(),before=structuredClone(input);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;throw Error('must not launch');}) as any});
+ expect(actual).toMatchObject({kind:'setup',seedQuote:'',questionQuote:'',optionIndex:null,optionQuote:''});
+ expect(calls).toBe(0);expect(input).toEqual(before);
+});
+test.each([
+ ['a remedy option',(q:any)=>{q.options[2]={label:'Add a hosted sandbox',description:'Skip the local stack for the first call.'};}],
+ ['remedy-only options',(q:any)=>{q.options=[{label:'Automate key issuance',description:'Instant key.'},{label:'Add a copy-paste curl',description:'Prove the server is up.'}];}],
+ ['a non-empathy header',(q:any)=>{q.header='TTHW target';}],
+ ['a brief that poses a finding',(q:any)=>{q.question=q.question.replace(/^D1 — Does this first-run narrative match reality\?/,'D1 — The narrative shows the emailed key stops the clock; should we automate key issuance?');}],
+ ['the match question only below the brief',(q:any)=>{q.question='D1 — Should the quickstart change?\n'+q.question;}],
+] as const)('narrative confirmation with %s is left to the assessor',(_label,change)=>{
+ const input=capturedNarrative();change((input.candidate as any).question);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;return {status:0,stdout:JSON.stringify({kind:'uncertain',seedId:null,questionId:null,optionId:null,reason:'Adversarial narrative control requires assessment.'}),stderr:''};}) as any});
+ expect(calls).toBe(1);expect(actual.kind).toBe('uncertain');
+});
 test('DX TTHW target question is a seeded finding without launching the assessor',()=>{
  for (const [questionText, labels] of [
   ['D2 — Which time-to-first-call target should this quickstart aim for?', ['< 10 min + measured wait (recommended)', 'Current trajectory']],
@@ -123,8 +151,102 @@ test('DX TTHW target question is a seeded finding without launching the assessor
  expect(calls).toBe(0);
  }
 });
+test('captured Opus "time-to-first-SDK-call target" questions and the template wording are seeded findings without the assessor',()=>{
+ const noLaunch=(input:PlanFloorReview)=>{let calls=0;const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;return {status:0,stdout:JSON.stringify({kind:'uncertain',seedId:null,questionId:null,optionId:null,reason:'Assessor launched.'}),stderr:''};}) as any});return {actual,calls};};
+ expect(sdkCallTarget.captures).toHaveLength(2);
+ for (const capture of sdkCallTarget.captures) {
+  const {actual,calls}=noLaunch(structuredClone(capture.review) as PlanFloorReview);
+  expect(calls,capture.source).toBe(0);expect(actual.kind).toBe('finding');expect(actual.questionQuote).toMatch(/time-to-first-SDK-call target/);
+ }
+ const retitle=(title:string)=>{const input=structuredClone(sdkCallTarget.captures[0].review) as PlanFloorReview;const q=(input.candidate as any).question;
+  q.question=q.question.replace(/^[^\n]*/,`D2 — ${title}`);return input;};
+ expect(noLaunch(retitle('Which target fits this journey?')).calls).toBe(0);
+ for (const title of ['Does this empathy narrative match the first-call journey?','Which target should the docs link to?','Which target audience should this SDK serve?',
+  'Which time-to-first-SDK-call target did you measure?','Which review mode should I use?','Which onboarding step should we cut first?'])
+  expect(noLaunch(retitle(title)).calls,title).toBe(1);
+});
 test('an exhausted deadline starts no assessment process',()=>{
  let calls=0;expect(()=>judgePlanFloorReview(review(),{binary:'fake',model:'warmup',deadlineAt:Date.now()-1,invoke:(()=>{calls++;}) as any})).toThrow('deadline');expect(calls).toBe(0);
+});
+
+const tthwReview = ():PlanFloorReview=>({seed:FORCING_FLOOR_DEVEX,candidate:{transport:'native',
+ identity:'7cee1bbe-26cc-4121-8f27-131f5972a544:toolu_01FtAP1GCpoKcCYMzQHQZJ7q:question:0',question:{
+ header:'TTHW target', multiSelect:false,
+ question:'D2 — Which TTHW target should this journey be measured against?\nProject/branch/task: gstack-plan-count-4q6Zyp on main, PLAN.md SDK quickstart, DX POLISH mode.\nELI10: TTHW (time to hello world) is the clock from opening the quickstart to the first SDK call that works. For your first-time developer, the declared 8 steps take an estimated 35-80 minutes of hands-on work plus an unbounded wait for a human to email back a key.',
+ options:[
+  {label:'A) Champion (< 2 min)',description:'✅ Stripe-tier bar; every remaining step looks indefensible\n✅ Puts key and database questions on the table now\n❌ Not reachable via docs alone; key email, Postgres, clone-first are all outside POLISH'},
+  {label:'B) Competitive (2-5 min) (recommended)',description:'✅ Peer baseline your developer expects\n✅ Shows which gaps docs polish closes vs needs a process decision\n❌ Still blocked by emailed key and local Postgres; POLISH lands ~20-40 min + wait'},
+  {label:'C) Current trajectory',description:'✅ Zero process change needed; review sharpens the 8 steps as written\n✅ No pressure on processes you may not control\n❌ Accepts red-flag tier; predicted 50-70% abandonment stays'},
+  {label:"D) Tell me what's realistic",description:"✅ You know key issuance and infra constraints I can't see\n✅ Your number becomes the declared clock\n❌ One more round trip before the passes"},
+ ]}}});
+const firstSdkCallReview = ():PlanFloorReview=>({seed:FORCING_FLOOR_DEVEX,candidate:{transport:'native',
+ identity:'b191254c-1571-465a-a49b-e2c10019bfc2:toolu_0153xwUmLKBghW6M6mQEqEG4:question:0',question:{
+ header:'TTHW target',multiSelect:false,
+ question:'D2 — Which time-to-first-call target should this review hold the plan to?\nProject/branch/task: gstack-plan-count-M3R8Qq on main, /plan-devex-review of PLAN.md in DX POLISH mode.\nELI10: TTHW (time to hello world) is the clock from reading Step 1 to a first SDK call that returns something the developer understands. For this persona the estimate is ~25-40 min of active work plus an unbounded wait for an emailed key (8 declared steps, ~12 actions). Reported peers (Stripe, Twilio) sit near 3 min, but they start hosted with an instant key, so the clocks are not equivalent. The target decides what "done" means for every later score.',
+ options:[
+  {label:'A) Champion (< 2 min)',description:'✅ Matches the reported leaders; first call before the developer loses interest. ✅ Forces the three peer-divergent choices onto the table. ❌ Infeasible without hosted sandbox or instant key: scope expansion outside POLISH.'},
+  {label:'B) Competitive (2-5 min)',description:'✅ Reachable if key issuance is automated and Postgres is not required pre-call. ✅ Keeps the repo-clone model, no hosted service. ❌ Requires removing Step 4 or 7 from the pre-call path, a scope change you marked undecided.'},
+  {label:'C) Current trajectory, polished (recommended)',description:'✅ Honors supplied scope; all 8 steps get verify checks, exact commands, named failures. ✅ Key wait disclosed with expected turnaround. ❌ Stays in the >10 min red-flag tier regardless of doc quality.'},
+  {label:"D) Tell me what's realistic",description:'✅ You know the key turnaround and infra constraints. ✅ A real number replaces my estimate in the report. ❌ Needs you to supply a target and reasoning now.'},
+ ]}}});
+test.each(['first SDK call','first API call','first successful call','first call'])('target choice grounds the journey in its %s action without requiring a quickstart label',action=>{
+ const input=firstSdkCallReview(),q=(input.candidate as any).question;q.question=q.question.replace('first SDK call',action);
+ const before=structuredClone(input);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;throw Error('must not launch');}) as any});
+ expect(actual).toMatchObject({kind:'finding',questionQuote:'Which time-to-first-call target should this review hold the plan to?',optionIndex:1,optionQuote:q.options[0].label});
+ expect(validatePlanFloorAssessment(input,actual)).toEqual(actual);expect(calls).toBe(0);expect(input).toEqual(before);
+});
+test.each([
+ ['setup',(q:any)=>q.question='D2 — Which review mode should we use?\n'+q.question],
+ ['unrelated',(q:any)=>q.question='D2 — Should we add dark mode?\n'+q.question],
+ ['history',(q:any)=>q.question='Previously asked: '+q.question],
+ ['non-target labels',(q:any)=>q.options.forEach((o:any,i:number)=>o.label=['Champion reviewer','Competitive analysis','Review mode','Continue'][i])],
+ ['metric name alone',(q:any)=>q.question=q.question.split('\n')[0]+'\nThere is a wait for an emailed key.'],
+ ['missing key obstacle',(q:any)=>q.question=q.question.split('\n')[0]+'\nThis is the first SDK call.'],
+] as const)('first-call context retains the %s boundary',(_label,change)=>{
+ const input=firstSdkCallReview();change((input.candidate as any).question);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;return {status:0,stdout:JSON.stringify({kind:'uncertain',seedId:null,questionId:null,optionId:null,reason:'Adversarial first-call control requires assessment.'}),stderr:''};}) as any});
+ expect(calls).toBe(1);expect(actual.kind).toBe('uncertain');
+});
+test.each([
+ 'Which TTHW target should this quickstart be measured against?',
+ 'Which TTHW target should this journey be measured against?',
+ 'What time-to-first-call target should we use for this onboarding flow?',
+ 'Which Time-to-Hello-World target fits this SDK journey?',
+])('current target-choice structure is a finding without an answer: %s', brief=>{
+ const input=tthwReview(),q=(input.candidate as Extract<PlanFloorReview['candidate'],{transport:'native'}>).question;
+ q.question=q.question.replace(q.question.split('\n')[0]!,`D2 — ${brief}`);
+ const before=structuredClone(input);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;throw Error('must not launch');}) as any});
+ expect(actual).toMatchObject({kind:'finding',questionQuote:brief,optionIndex:1,optionQuote:q.options[0]!.label});
+ expect(validatePlanFloorAssessment(input,actual)).toEqual(actual);
+ expect(calls).toBe(0);expect(input).toEqual(before);
+ expect(pickPlanFloorMode('plan-devex-review',q)).toBeNull();expect(pickPlanFloorProductType(q,'sdk-documentation')).toBeNull();
+});
+test.each([
+ ['setup with target in context',(q:any)=>q.question='D2 — Which review mode should we use?\n'+q.question],
+ ['unrelated current decision',(q:any)=>q.question='D2 — Should we add dark mode?\n'+q.question],
+ ['historical quoted question',(q:any)=>q.question='Previously asked: '+q.question],
+ ['historical target selection',(q:any)=>q.question=q.question.replace(/should this \w+ be measured against/,'did we choose yesterday')],
+ ['non-target labels',(q:any)=>q.options.forEach((o:any,i:number)=>o.label=['Champion reviewer','Competitive analysis','Review mode','Continue'][i])],
+ ['setup labels with target descriptions',(q:any)=>q.options.forEach((o:any,i:number)=>{o.label=['DX POLISH','DX TRIAGE','DX EXPANSION','Skip review'][i];o.description+=' Competitive target under 10 min; measured wait.';})],
+ ['missing quickstart evidence',(q:any)=>q.question=q.question.split('\n')[0]],
+] as const)('%s receives no deterministic finding credit',(_label,change)=>{
+ const input=tthwReview(),q=(input.candidate as any).question;
+ q.question=q.question.replace('this journey','this quickstart');change(q);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;return {status:0,stdout:JSON.stringify({kind:'uncertain',seedId:null,questionId:null,optionId:null,reason:'Adversarial control requires assessment.'}),stderr:''};}) as any});
+ expect(calls).toBe(1);expect(actual.kind).toBe('uncertain');
+});
+test('a current TTHW choice without the owned seed evidence is not deterministic',()=>{
+ const input=tthwReview();input.seed='A different plan: add dark mode to the dashboard.';let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;return {status:0,stdout:JSON.stringify({kind:'unrelated',seedId:null,questionId:null,optionId:null,reason:'Different seed.'}),stderr:''};}) as any});
+ expect(calls).toBe(1);expect(actual.kind).toBe('unrelated');
 });
 
 test('citations retain exact source wrapping and quotes without accepting rewritten evidence',()=>{

@@ -7,7 +7,7 @@ import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { runAgentSdkTest, toSkillTestResult, passThroughNonAskUserQuestion } from './helpers/agent-sdk-runner';
 import { runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS } from './helpers/office-hours-attempt';
-import { publicEvents, redactPublicValue } from './helpers/setup-gbrain-sandbox';
+import { publicEvents, redactPublicValue, setupGbrainRemoteAnswer } from './helpers/setup-gbrain-sandbox';
 import { buildSetupGbrainFixture } from './helpers/setup-gbrain-fixture';
 import { resolveEvalModel } from '../lib/eval-model';
 
@@ -16,6 +16,24 @@ type Mode = 'success' | 'max-turns' | 'missing-registration' | 'missing-mode' | 
   | 'returned-api-error' | 'returned-execution-error' | 'returned-budget-error'
   | 'final-retain-error' | 'failed-retain-error' | 'cleanup-error' | 'close-error'
   | 'sdk-error' | 'deadline' | 'slow-setup' | 'rate-limit' | 'late' | 'owned-http';
+// Captured Step 5a question (census 36641820398, slice 20): the old actor matched
+// "skip" in the decline label and declined the registration the case asserts.
+const REGISTER_MCP_QUESTION = { header: 'Register MCP', multiSelect: false,
+  question: 'Give Claude Code a typed tool surface for gbrain? This registers `gbrain` as a user-scope HTTP MCP at http://127.0.0.1:1/mcp with the bearer token, replacing any prior `gbrain` MCP registration.',
+  options: [{ label: 'Yes (Recommended)', description: 'Run `claude mcp remove gbrain` then `claude mcp add --scope user --transport http gbrain <URL>`.' },
+    { label: 'No, skip registration', description: "Leave Claude Code's MCP config untouched." }] };
+test('Path 4 actor registers the MCP at Step 5a and declines every other gate', () => {
+  expect(setupGbrainRemoteAnswer(REGISTER_MCP_QUESTION)).toBe('Yes (Recommended)');
+  expect(setupGbrainRemoteAnswer({ header: 'MCP', question: 'Register gbrain as a Claude Code MCP server?',
+    options: [{ label: 'Skip for now' }, { label: 'Register' }] })).toBe('Register');
+  expect(setupGbrainRemoteAnswer({ question: 'Remote setup privacy gate', options: [{ label: 'Proceed (Recommended)' }, { label: 'Decline' }] })).toBe('Decline');
+  expect(setupGbrainRemoteAnswer({ header: 'Artifacts', question: 'Provision a private artifacts repo for gbrain?',
+    options: [{ label: 'Yes (Recommended)' }, { label: 'No thanks' }] })).toBe('No thanks');
+  expect(setupGbrainRemoteAnswer({ header: 'Repo policy', question: 'How should gbrain treat this remote when importing via MCP?',
+    options: [{ label: 'read-write (Recommended)' }, { label: 'read-only' }, { label: 'skip-for-now' }] })).toBe('skip-for-now');
+  expect(setupGbrainRemoteAnswer({ question: 'Pick a mode', options: [{ label: 'A' }, { label: 'B' }] })).toBe('B');
+});
+
 async function fixture(modes: Mode[], budget = 300_000, pathApi = path) {
   const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-caller-evidence-'));
   const callbacks: Array<() => Promise<void>> = [], finalizers: Array<() => Promise<void>> = [];
@@ -49,6 +67,9 @@ async function fixture(modes: Mode[], budget = 300_000, pathApi = path) {
       const decision = await input.options.canUseTool('AskUserQuestion', { questions: [{ question,
         options: [{ label: 'Proceed' }, { label: 'Decline' }] }] }, {});
       expect(decision.updatedInput.answers[question]).toBe('Decline');
+      const register = REGISTER_MCP_QUESTION.question;
+      const registration = await input.options.canUseTool('AskUserQuestion', { questions: [REGISTER_MCP_QUESTION] }, {});
+      expect(registration.updatedInput.answers[register]).toBe('Yes (Recommended)');
       expect(await input.options.canUseTool('Read', { file_path: 'fixture' }, {})).toEqual({ behavior: 'allow', updatedInput: { file_path: 'fixture' } });
       const url = /Use this MCP URL: (http:\/\/[^ ]+)\./.exec(input.prompt)![1]!;
       const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}' });
@@ -108,7 +129,7 @@ async function fixture(modes: Mode[], budget = 300_000, pathApi = path) {
       expect(opts.userPrompt).toContain('Walk through Steps 4a, 4b, 4c, 5a, 8, 10 ONLY.');
       return runAgentSdkTest(opts);
     }, toSkillTestResult, passThroughNonAskUserQuestion, resolveClaudeBinary: () => '/not-executed/injected-query',
-    runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS, publicEvents, redactPublicValue, resolveEvalModel,
+    runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS, publicEvents, redactPublicValue, setupGbrainRemoteAnswer, resolveEvalModel,
     EvalCollector: class { addTest(row: any) { rows.push({ ...row, attempt: rows.length + 1 }); } async finalize() {} },
     // Inject only the three environment inputs read by the extracted paid callback.
     process: { env: { GSTACK_EVAL_DIR: evidenceRoot, PATH: process.env.PATH, EVALS_MODEL: process.env.EVALS_MODEL } },
@@ -227,12 +248,16 @@ test('existing SDK429 retry policy stays three and closes the prior query before
 });
 
 test('late first completion cannot approve tools or overwrite evidence after a fresh second invocation', async () => {
-  const result = await fixture(['late', 'success'], 250);
+  // The budget bounds the second, successful attempt too (stub server, two mkdtemps, the fake SDK
+  // run with its HTTP fetch). At 250ms it failed 4 of 4 times on windows-latest once the shard
+  // pack moved this file next to heavier neighbours (#3449, run 40263984171); 2s keeps the first
+  // attempt late and leaves the second one room on a loaded runner.
+  const result = await fixture(['late', 'success'], 2_000);
   expect(result.rows.map(r => [r.passed, r.attempt])).toEqual([[false, 1], [true, 2]]);
   expect(result.evidence[0].querySettled).toBe(0);
   expect(result.evidence[0].attemptId).not.toBe(result.evidence[1].attemptId);
   expect(result.homes[0]).not.toBe(result.homes[1]);
-}, 10_000);
+}, 20_000);
 
 test('HTTP finalization closes only connections belonging to the owned fixture server', async () => {
   const foreign = http.createServer((_req, res) => res.end('foreign'));

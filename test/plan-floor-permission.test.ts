@@ -17,13 +17,14 @@ import {readPlanFloorTarget} from './helpers/plan-floor-target';
 import {createFilePermissionRecorder, recordFilePermission, currentFilePermissionBinding, readPendingWriteInput, isCroppedEditPermissionVisible} from './helpers/plan-count-file-permission';
 import captured from './fixtures/plan-floor-permission-fb10.json';
 import croppedEdit from './fixtures/plan-edit-cropped-permission-1579.json';
+import toolOnlyCreate from './fixtures/plan-ceo-floor-toolonly-create.json';
 import {FORCING_FLOOR_CEO, FORCING_FLOOR_ENG, FORCING_FLOOR_DESIGN, FORCING_FLOOR_DEVEX} from './fixtures/forcing-finding-seeds';
 
 const ROOT = path.resolve(import.meta.dir, '..');
-const source = fs.readFileSync(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'), 'utf8');
+const source = fs.readFileSync(path.join(ROOT, 'test/helpers/pty/runners/floor.ts'), 'utf8');
 const start = source.indexOf('export async function runPlanSkillFloorCheck(');
 if (start < 0) throw Error('Missing actual floor runner');
-const body = new Bun.Transpiler({loader:'ts'}).transformSync(source.slice(start).replace(/^export /, ''));
+const body = new Bun.Transpiler({loader:'ts'}).transformSync(source.slice(start).replace(/^export /gm, ''));
 const QUESTIONS = {
   ceo: {header:'Evidence', question:'The pricing plan has no developer interviews. Should we validate that pricing blocks adoption before launching?',
     multiSelect:false, options:[{label:'Interview developers',description:'Test whether pricing is the adoption barrier before changing the tier.'}, {label:'Launch now',description:'Keep the unvalidated premise and collect evidence after launch.'}]},
@@ -41,16 +42,16 @@ const render = (question: typeof QUESTIONS.ceo) => ['☐ '+question.header,quest
   ...question.options.flatMap((o,i)=>[`${i?' ':'❯'} ${i+1}. ${o.label}`,o.description]),
   'Enter to select · ↑/↓ to navigate · Esc to cancel'].join('\n');
 const FINDING = render(QUESTIONS.ceo);
-type Mode = 'planning-owned' | 'planning-foreign' | 'cropped-edit' | 'cropped-edit-missing' | 'cropped-edit-changed' | 'cropped-edit-completed' | 'captured' | 'owned' | 'owned-no-question' | 'foreign' | 'wrong-session' | 'missing-native' | 'linked-target' |
+type Mode = 'captured-unbound-create' | 'planning-owned' | 'planning-foreign' | 'cropped-edit' | 'cropped-edit-missing' | 'cropped-edit-changed' | 'cropped-edit-completed' | 'captured' | 'owned' | 'owned-no-question' | 'foreign' | 'wrong-session' | 'missing-native' | 'linked-target' |
   'native-question' | 'scope' | 'prose' | 'finding' | 'routing' | 'unrelated' | 'partial' | 'quoted' | 'foreign-question' |
   'stale-question' | 'answered-question' | 'failed-question' | 'mismatched-use' | 'duplicate-use' | 'judge-error' | 'mode' | 'pending-hook' | 'failed-hook' | 'packet' | 'prose-quoted' | 'prose-partial' | 'prose-foreign' | 'prose-stale' | 'product-type' | 'product-type-undeclared' |
-  'unmatched-hook' | 'invalid-hook' | 'missing-hook' | 'idle-hook' | 'transition-hook' | 'unmatched-native' | 'dx-setup' | 'dx-no-finding' | 'dx-undeclared' | 'dx-cropped' | 'dx-unrelated' | 'dx-uncertain' | 'dx-changing-call';
+  'unmatched-hook' | 'invalid-hook' | 'missing-hook' | 'idle-hook' | 'transition-hook' | 'unmatched-native' | 'dx-setup' | 'dx-editor-hint' | 'dx-no-finding' | 'dx-undeclared' | 'dx-cropped' | 'dx-unrelated' | 'dx-uncertain' | 'dx-changing-call';
 interface SnapshotOptions { evalDir: string; failFirst?: boolean; interrupt?: boolean }
 
 // Complete actual floor function; only clock/PTY/public-event and assessor
 // boundaries are controlled. Real ownership, permission and viewport parsers run.
 // Assessor responses are fixtures, never actual model-quality evidence.
-async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: typeof routing.captures[number], productQuestion=productTypes.captures[0]!.question, snapshotOptions?: SnapshotOptions) {
+async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: typeof routing.captures[number], productQuestion=productTypes.captures[0]!.question, snapshotOptions?: SnapshotOptions, nativeQuestion?: typeof QUESTIONS.ceo) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'floor-permission-free-'));
   const config = path.join(dir, '.claude');
   let now = Date.now() - (mode.includes('hook') || mode.startsWith('cropped-edit') ? 10_000 : 1), launched: any, fixture: ReturnType<typeof createPlanCountFixture> | undefined;
@@ -60,7 +61,7 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
   const retain = snapshotOptions ? createPlanCountSnapshotWriter({EVALS_RUN_ID:'floor-retention-free',GSTACK_EVAL_DIR:snapshotOptions.evalDir}) : undefined;
   const recorders: NonNullable<ReturnType<typeof createFilePermissionRecorder>>[] = [];
   let transcript: any = {status:'ready', calls:[], assistantMessages:[]};
-  const question = structuredClone(QUESTIONS[kind]);
+  const question = structuredClone(nativeQuestion ?? QUESTIONS[kind]);
   if (mode.startsWith('planning-')) question.question += '\n' + ('Explain the owned seeded finding and its existing remedy.\n').repeat(50);
   class Clock extends Date { static now() { return now; } }
   const boundary = {
@@ -89,6 +90,8 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
       judgments.push(structuredClone(input));
       expect(opts.model).toBe(resolveEvalModel('warmup')); expect(opts.deadlineAt).toBeGreaterThan(now);
       floor.buildPlanFloorReviewPrompt(input);
+      if(nativeQuestion) return floor.judgePlanFloorReview(input,{...opts,
+        invoke:(()=>{throw Error('Deterministic target choice must not launch an assessor');}) as any});
       if(mode==='judge-error') throw Error('controlled assessment failure');
       const dxSetup = mode.startsWith('dx-') && input.candidate.transport==='native' && input.candidate.question.header===dxCustom.call.questions[0]!.header;
       const classification = dxSetup ? (mode==='dx-unrelated'?'unrelated':mode==='dx-uncertain'?'uncertain':'setup') : mode==='routing'||mode==='scope'||mode==='native-question'||mode==='product-type-undeclared' ? 'setup' :
@@ -129,7 +132,7 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
       const pendingFilePermissionFiles = expected ? [(() => {
         const recorder = createFilePermissionRecorder(opts.cwd, config, expected)!;
         recorders.push(recorder);
-        if (mode !== 'missing-native' && mode !== 'cropped-edit-missing') recordFilePermission(JSON.stringify({
+        if (mode !== 'missing-native' && mode !== 'cropped-edit-missing' && mode !== 'captured-unbound-create') recordFilePermission(JSON.stringify({
           hook_event_name:'PreToolUse', tool_name:crop?'Edit':'Write', session_id:mode === 'wrong-session' ? 'foreign' : sid,
           tool_use_id:'write1', cwd:opts.cwd,
           transcript_path:mode === 'wrong-session' ? path.join(config,'projects','owned','foreign.jsonl') : journal,
@@ -142,6 +145,7 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
       const permissionPath = mode === 'foreign' ? path.join(dir, 'foreign', path.basename(expected ?? 'report.md')) : expected;
       const permission = crop ? croppedEdit.screen.replaceAll(path.basename(croppedEdit.hook.expected),path.basename(expected))
         .replace('empathy narrative',mode==='cropped-edit-changed'?'different narrative':'empathy narrative') : mode === 'captured' ? captured.rawPermission :
+        mode === 'captured-unbound-create' ? toolOnlyCreate.screen.replaceAll(toolOnlyCreate.basename, path.basename(expected)) :
         `Create file\n${permissionPath}\n────────────────\n 1 # Working review\n────────────────\nDo you want to create ${path.basename(permissionPath ?? 'report.md')}?\n❯ 1. Yes\n  2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session\n  3. No\nEsc to cancel · Tab to amend`;
       return {
         hermeticConfigDir: config, pendingFilePermissionFiles, pendingQuestionFile:hookRecorder?.file,
@@ -244,6 +248,7 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
               if(mode==='dx-no-finding') {transcript.calls=[old];screen='';}
               else {publish();transcript.calls.unshift(old);}
             } else throw Error('Unexpected DX custom input: '+JSON.stringify(input));
+            if(mode==='dx-editor-hint' && input!=='\r')screen=screen.replace(' · Esc to cancel',' · ctrl+g to edit in Vim · Esc to cancel');
             history+='\n'+screen;
           } else if (input === '1\r') {
             granted = true;
@@ -256,13 +261,14 @@ async function exercise(mode: Mode, kind: keyof typeof SEEDS = 'ceo', capture?: 
     },
   };
   const run = new Function(...Object.keys(boundary), body + '\nreturn runPlanSkillFloorCheck;')(...Object.values(boundary));
+  const driver: runner.PtyDriver = {launch: boundary.launchClaudePty, now: () => now, monotonic: () => now, sleep: boundary.Bun.sleep};
   try {
     let result: any, error: unknown;
     try {
       result = await run({skillName:`plan-${kind}-review`, slashCommand:`/plan-${kind}-review`, followUpPrompt:SEEDS[kind],
         productType:mode==='product-type'||mode.startsWith('dx-')?'sdk-documentation':undefined,
         devexSetupContext:mode.startsWith('dx-')&&mode!=='dx-undeclared'?dxCustom.reply:undefined,
-        requestedPlanPath:mode === 'captured' ? undefined : `/tmp/gstack-test-plan-${kind}-floor.md`, timeoutMs:100_000});
+        requestedPlanPath:mode === 'captured' ? undefined : `/tmp/gstack-test-plan-${kind}-floor.md`, timeoutMs:100_000, driver});
     } catch(caught) { if(!snapshotOptions?.interrupt)throw caught; error=caught; }
     expect(closed).toBe(1); expect(fs.existsSync(fixture!.cwd)).toBe(false);
     expect(recorders.every(recorder=>!fs.existsSync(recorder.file))).toBe(true);
@@ -274,7 +280,19 @@ test('captured file permission never satisfies the floor through a waiting judge
   expect(captured.originalOutcome).toBe('auq_observed');
   expect(runner.isPermissionDialogVisible(captured.rawPermission)).toBe(true);
   const e = await exercise('captured');
-  expect(e.result.outcome).toBe('timeout'); expect(e.result.auqObserved).toBe(false);
+  expect(e.result.outcome).toBe('permission_unanswered'); expect(e.result.auqObserved).toBe(false);
+  // gstack-timing-ok: injected exercise clock; failing within the 20 s bound instead of the timeout is the contract
+  expect(e.result.summary).toStartWith('PERMISSION_DIALOG_UNANSWERED: '); expect(e.result.elapsedMs).toBeLessThan(50_000);
+  expect(e.sent).toEqual(['/plan-ceo-review PLAN.md\r']); expect(e.judgments).toHaveLength(0);
+});
+test('the captured CI 39161502626 Create left without an owned grant fails fast with a named cause', async () => {
+  expect(toolOnlyCreate.recorded.outcome).toBe('timeout');
+  expect(runner.isPermissionDialogVisible(toolOnlyCreate.screen)).toBe(true);
+  const e = await exercise('captured-unbound-create');
+  expect(e.result).toMatchObject({outcome:'permission_unanswered', auqObserved:false});
+  expect(e.result.summary).toStartWith('PERMISSION_DIALOG_UNANSWERED: ');
+  // gstack-timing-ok: injected exercise clock; failing within the 20 s bound instead of the timeout is the contract
+  expect(e.result.elapsedMs).toBeLessThan(50_000);
   expect(e.sent).toEqual(['/plan-ceo-review PLAN.md\r']); expect(e.judgments).toHaveLength(0);
 });
 test('one owned native Write grant enables the actual later question without answering it', async () => {
@@ -294,12 +312,12 @@ for (const mode of ['planning-owned','planning-foreign'] as const) test(`actual 
 test.each(['cropped-edit','cropped-edit-missing','cropped-edit-changed','cropped-edit-completed'] as Mode[])('%s routes through the actual floor only after exact ownership',async mode=>{
   const e=await exercise(mode,'devex');
   expect(e.sent).toEqual(mode==='cropped-edit'?['/plan-devex-review PLAN.md\r','1\r']:['/plan-devex-review PLAN.md\r']);
-  expect(e.result.outcome).toBe(mode==='cropped-edit'?'auq_observed':'timeout');
+  expect(e.result.outcome).toBe(mode==='cropped-edit'?'auq_observed':'permission_unanswered');
   expect(e.judgments).toHaveLength(mode==='cropped-edit'?1:0);
   if(mode==='cropped-edit')expect(e.saved.observation.pendingQuestion.answered).toBe(false);
 });
 test.each(['owned-no-question','foreign','wrong-session','missing-native','linked-target'] as Mode[])('%s cannot supply finding credit', async mode => {
-  const e = await exercise(mode); expect(e.result.outcome).toBe('timeout');
+  const e = await exercise(mode); expect(e.result.outcome).toBe(mode === 'owned-no-question' ? 'timeout' : 'permission_unanswered');
   expect(e.sent).toEqual(mode === 'owned-no-question' ? ['/plan-ceo-review PLAN.md\r','1\r'] : ['/plan-ceo-review PLAN.md\r']);
   expect(e.judgments).toHaveLength(0);
 });
@@ -326,6 +344,28 @@ for(const kind of Object.keys(SEEDS) as (keyof typeof SEEDS)[]) test(`${kind} co
   expect(e.judgments[0].seed).toContain(SEED_QUOTES[kind]);expect(e.sent).toEqual([`/plan-${kind}-review PLAN.md\r`]);
   expect(e.saved.observation.pendingQuestion.answered).toBe(false);
   expect(e.saved.observation.pendingQuestion.answers).toBeUndefined();
+});
+test('actual floor callback uses the deterministic TTHW finding and leaves its native question unanswered',async()=>{
+  const question={header:'TTHW target',question:'D2 — Which TTHW target should this journey be measured against?\nThe SDK quickstart has eight steps and an unbounded wait for an emailed API key.',multiSelect:false,
+    options:[{label:'A) Champion (< 2 min)',description:'Puts key and database questions on the table; not reachable via docs alone.'},
+      {label:'B) Competitive (2-5 min) (recommended)',description:'Shows which gaps docs polish closes; still blocked by emailed key and local Postgres.'}]};
+  const e=await exercise('finding','devex',undefined,undefined,undefined,question);
+  expect(e.result.outcome).toBe('auq_observed');expect(e.result.auqObserved).toBe(true);
+  expect(e.judgments).toHaveLength(1);expect(e.judgments[0]!.candidate).toMatchObject({transport:'native',question});
+  expect(e.saved.observation.floorAssessment).toMatchObject({kind:'finding',optionIndex:1,optionQuote:question.options[0]!.label});
+  expect(e.sent).toEqual(['/plan-devex-review PLAN.md\r']);
+  expect(e.saved.observation.pendingQuestion.answered).toBe(false);expect(e.saved.observation.pendingQuestion.answers).toBeUndefined();
+});
+test('actual floor callback consumes the first-SDK-call target finding without a quickstart keyword or an answer',async()=>{
+  const question={header:'TTHW target',question:'D2 — Which time-to-first-call target should this review hold the plan to?\nProject/branch/task: gstack-plan-count-M3R8Qq on main, /plan-devex-review of PLAN.md in DX POLISH mode.\nELI10: TTHW (time to hello world) is the clock from reading Step 1 to a first SDK call that returns something the developer understands. For this persona the estimate is ~25-40 min of active work plus an unbounded wait for an emailed key (8 declared steps, ~12 actions).',multiSelect:false,
+    options:[{label:'A) Champion (< 2 min)',description:'Matches the reported leaders; infeasible without hosted sandbox or instant key: scope expansion outside POLISH.'},
+      {label:'B) Competitive (2-5 min)',description:'Reachable if key issuance is automated and Postgres is not required pre-call; requires a scope change.'}]};
+  const e=await exercise('finding','devex',undefined,undefined,undefined,question);
+  expect(e.result.outcome).toBe('auq_observed');expect(e.result.auqObserved).toBe(true);
+  expect(e.judgments).toHaveLength(1);expect(e.judgments[0]!.candidate).toMatchObject({transport:'native',question});
+  expect(e.saved.observation.floorAssessment).toMatchObject({kind:'finding',optionIndex:1,optionQuote:question.options[0]!.label});
+  expect(e.sent).toEqual(['/plan-devex-review PLAN.md\r']);
+  expect(e.saved.observation.pendingQuestion.answered).toBe(false);expect(e.saved.observation.pendingQuestion.answers).toBeUndefined();
 });
 test.each(['unrelated','quoted','foreign-question','stale-question','answered-question','failed-question','mismatched-use','duplicate-use','failed-hook'] as Mode[])('%s cannot earn finding credit',async mode=>{
   const e=await exercise(mode);expect(e.result.outcome).toBe('timeout');expect(e.result.auqObserved).toBe(false);
@@ -423,10 +463,17 @@ test('interruption retains the last sampled binding and final recorder status be
     const runRoot=path.join(evalDir,'pty-count','floor-retention-free');
     const dirs=fs.readdirSync(runRoot);expect(dirs).toHaveLength(1);
     const record=JSON.parse(fs.readFileSync(path.join(runRoot,dirs[0],'observation.json'),'utf8'));
-    expect(record.state).toBe('in_progress');expect(record.captureReason).toBe('before_cleanup');
+    expect(record.state).toBe('threw');expect(record.captureReason).toBe('before_cleanup');
+    expect(record.error).toBe(String(e.error));
     expect(record.outcome).toBeUndefined();expect(record.auqObserved).toBeUndefined();
     expect(record.questionDiagnostics.recorderStatus.status).toBe('pending');
     expect(record.questionDiagnostics.validatedPendingQuestion.questions).toEqual([QUESTIONS.eng]);
+    const progress=e.snapshots.filter(s=>s.observation.state==='in_progress');
+    expect(progress.length).toBeGreaterThan(0);
+    expect(record.questionDiagnostics.sampledAt).toBe(progress.at(-1)!.observation.questionDiagnostics.sampledAt);
+    expect(record.questionDiagnostics.validatedPendingQuestion).toEqual(progress.at(-1)!.observation.questionDiagnostics.validatedPendingQuestion);
+    expect(record.pendingQuestion).toBeUndefined();expect(record.publicTools).toEqual([]);expect(e.judgments).toHaveLength(0);
+    expect(fs.readFileSync(path.join(runRoot,dirs[0],'terminal.screen.log'),'utf8')).toBe(e.saved.viewport);
     expect(fs.existsSync(record.capture.cwd)).toBe(false);
   } finally {fs.rmSync(evalDir,{recursive:true,force:true});}
 });
@@ -523,6 +570,13 @@ test('DX declared context answers setup through native custom input, then awaits
   expect(e.sent).toEqual(['/plan-devex-review PLAN.md\r','4','\x1b[200~'+dxCustom.reply+'\x1b[201~','\r']);
   expect(e.launched.rows).toBe(80);
   expect(e.fixture!.seed).toContain(dxCustom.reply);
+  expect(e.saved.observation.setupContextReplies[0].stage).toBe('done');
+  expect(e.saved.observation.transcript.calls.find((c:any)=>c.answered).answers).toEqual({[dxCustom.call.questions[0]!.question]:dxCustom.reply});
+});
+test('actual DX floor callback consumes editor-hint paste and submit stages before judging the later finding',async()=>{
+  const e=await exercise('dx-editor-hint','devex');
+  expect(e.result.outcome).toBe('auq_observed');expect(e.judgments).toHaveLength(2);
+  expect(e.sent).toEqual(['/plan-devex-review PLAN.md\r','4','\x1b[200~'+dxCustom.reply+'\x1b[201~','\r']);
   expect(e.saved.observation.setupContextReplies[0].stage).toBe('done');
   expect(e.saved.observation.transcript.calls.find((c:any)=>c.answered).answers).toEqual({[dxCustom.call.questions[0]!.question]:dxCustom.reply});
 });

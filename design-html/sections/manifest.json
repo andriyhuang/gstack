@@ -2,7 +2,7 @@
   "$schema": "https://gstack.dev/schemas/section-manifest.json",
   "skill": "design-html",
   "version": 1,
-  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's decision-tree prose is the ONLY place that decides WHEN to read a section; required-reads live in the E2E fixtures. No machine predicate here — see docs/designs/v2_PLAN.md:663.",
+  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's decision-tree prose is the ONLY place that decides WHEN to read a section; required section reads are checked by test/carve-section-loading-design-html.test.ts. No machine predicate here — see docs/designs/v2_PLAN.md:663.",
   "sections": [
     {
       "id": "doctrine",
@@ -15,6 +15,12 @@
       "file": "pretext-patterns.md",
       "title": "Pretext wiring patterns + API reference",
       "trigger": "writing the finalized HTML in Step 3 — the Pretext wiring patterns and API cheatsheet are the required reference for all text-layout code"
+    },
+    {
+      "id": "craft",
+      "file": "craft.md",
+      "title": "Craft: Persuade pages and the craft floor",
+      "trigger": "writing the Step 1 implementation spec — the Persuade intake and archetype, and the craft floor every page ships with"
     },
     {
       "id": "detector-install-offer",

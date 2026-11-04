@@ -56,6 +56,7 @@ export const SCOPE_WRITE = new Set([
   'upload', 'viewport', 'newtab', 'closetab',
   'dialog-accept', 'dialog-dismiss',
   'download', 'scrape', 'archive',
+  'device', 'tap', 'swipe', 'pinch', 'touch',
 ]);
 
 /** Page-level power tools — JS execution, credential access, page mutations */
@@ -133,6 +134,9 @@ export function assertValidClientId(clientId: unknown): asserts clientId is stri
   }
   if (clientId.trim().toLowerCase() === 'root') {
     throw new ReservedClientIdError("clientId 'root' is reserved");
+  }
+  if (clientId.trim().toLowerCase().startsWith('session:')) {
+    throw new ReservedClientIdError("clientId prefix 'session:' is reserved for agent sessions");
   }
 }
 
@@ -377,7 +381,9 @@ export function exchangeSetupKey(setupKey: string, sessionExpiresSeconds?: numbe
 
 /**
  * Validate a token and return its info if valid.
- * Returns null for expired, revoked, or unknown tokens.
+ * Returns null for expired, revoked, or unknown tokens, and for unexchanged
+ * setup keys: a setup key authenticates only the /connect exchange, never a
+ * bearer request.
  * Root token returns a special root info object.
  */
 export function validateToken(token: string): TokenInfo | null {
@@ -396,7 +402,7 @@ export function validateToken(token: string): TokenInfo | null {
   }
 
   const info = tokens.get(token);
-  if (!info) return null;
+  if (!info || info.type !== 'session') return null;
 
   // Check expiry
   if (info.expiresAt && new Date(info.expiresAt) < new Date()) {

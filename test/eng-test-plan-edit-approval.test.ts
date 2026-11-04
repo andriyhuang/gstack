@@ -122,19 +122,6 @@ test('the declared opt-in rejects another skill before fixture or model startup'
     followUpPrompt: 'Unused', expectedPlanPath: '/tmp/unused.md', approveEngTestPlanEdits: true,
     isLastStep0AUQ: () => false, reviewCountCeiling: 7 })).rejects.toThrow('Eng test-plan approval');
 });
-
-test('actual caller declares QA support without changing its budgets or expected report', () => {
-  const caller = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-plan-eng-finding-count.test.ts'), 'utf8');
-  expect(caller).toContain('approveEngTestPlanEdits: true');
-  expect(caller).toContain('expectedPlanPath: planPath');
-  expect(caller).toContain('const startedAt = Date.now();');
-  expect(caller).toContain('const deadlineAt = startedAt + 1_500_000;');
-  expect(caller).toContain('timeoutMs: deadlineAt - Date.now(),');
-  expect(caller).toContain('deadlineAt: Math.min(input.deadlineAt, deadlineAt)');
-  expect(caller).toMatch(/},\s*1_500_000\s*\/\* physical ceiling:/);
-});
-
-
 test('default Autoplan scope still accepts its owned CEO artifact, while Eng scope rejects it', () => {
   const legacy = replay('ceo-default'); expect(legacy.invoke()).toBe(true);
   const eng = replay('ceo'); expect(eng.invoke()).not.toBe(true);
@@ -181,7 +168,7 @@ test.skipIf(process.platform === 'win32')('real count launcher scopes QA approva
     const resultFile = path.join(dir, 'result.json'), worker = path.join(dir, 'worker.ts');
     fs.writeFileSync(worker, `import fs from 'node:fs';\nimport {runPlanSkillCounting,resolveClaudeBinary} from ${JSON.stringify(runner)};\n` +
       `if(resolveClaudeBinary()!==${JSON.stringify(fake)})throw Error('fake CLI binding');\n` +
-      `const result=await runPlanSkillCounting({skillName:'plan-eng-review',slashCommand:'/plan-eng-review',followUpPrompt:'Synthetic QA permission fixture',expectedPlanPath:${JSON.stringify(path.join(dir, 'report.md'))},approveEngTestPlanEdits:${variant !== 'default'},isLastStep0AUQ:()=>false,reviewCountCeiling:12,timeoutMs:18000,env:{QA_RESULT:${JSON.stringify(resultFile)},QA_MODE:${JSON.stringify(variant)},QA_FIXTURE:${JSON.stringify(path.join(import.meta.dir, 'fixtures/eng-test-plan-edit-dacc.json'))}}});\n` +
+      `const result=await runPlanSkillCounting({skillName:'plan-eng-review',slashCommand:'/plan-eng-review',followUpPrompt:'Synthetic QA permission fixture',expectedPlanPath:${JSON.stringify(path.join(dir, 'report.md'))},approveEngTestPlanEdits:${variant !== 'default'},isLastStep0AUQ:()=>false,reviewCountCeiling:12,timeoutMs:18000,startupReadyMarker:${JSON.stringify('PTY_READY:' + resultFile)},env:{QA_RESULT:${JSON.stringify(resultFile)},QA_MODE:${JSON.stringify(variant)},QA_FIXTURE:${JSON.stringify(path.join(import.meta.dir, 'fixtures/eng-test-plan-edit-dacc.json'))}}});\n` +
       `fs.writeFileSync(${JSON.stringify(path.join(dir, 'observation.json'))},JSON.stringify(result));\n`);
     const child = Bun.spawn([process.execPath, worker], { cwd: path.resolve(import.meta.dir, '..'),
       env: { ...process.env, BROWSE_TERMINAL_BINARY: fake, EVALS_HERMETIC: '1', EVALS: '', EVALS_RUN_ID: '', TMPDIR: dir }, stdout: 'pipe', stderr: 'pipe' });

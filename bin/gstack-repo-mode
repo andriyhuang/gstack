@@ -25,7 +25,7 @@ fi
 # PWD-keyed slug cache matches other gstack project-state writers.
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
 [ -z "${REPO_ROOT:-}" ] && { echo "REPO_MODE=unknown"; exit 0; }
-SLUG=$(cd "$REPO_ROOT" && "$SCRIPT_DIR/gstack-slug" | sed -n 's/^SLUG=//p' | head -1)
+SLUG=$(cd "$REPO_ROOT" && "$SCRIPT_DIR/gstack-slug" --get REPO_SLUG | head -1)
 [ -z "${SLUG:-}" ] && { echo "REPO_MODE=unknown"; exit 0; }
 
 # Validate: only allow known values (prevent shell injection via source <(...))
@@ -41,7 +41,9 @@ if [ -n "$OVERRIDE" ] && [ "$OVERRIDE" != "null" ]; then
 fi
 
 # Check cache (7-day TTL)
-CACHE_DIR="$HOME/.gstack/projects/$SLUG"
+. "$SCRIPT_DIR/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $SCRIPT_DIR/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
+CACHE_DIR="$GSTACK_STATE_ROOT/projects/$SLUG"
 CACHE_FILE="$CACHE_DIR/repo-mode.json"
 if [ -f "$CACHE_FILE" ]; then
   # GNU first (#2195): on GNU coreutils `stat -f` SUCCEEDS with filesystem

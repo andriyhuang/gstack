@@ -36,7 +36,7 @@ import {
   type OverlayFixture,
 } from '../test/fixtures/overlay-nudges';
 import { firstAssistantMessageToolCount } from './helpers/overlay-measurement';
-import { CLAUDE_FRONTIER_EVAL_MODEL } from '../lib/eval-model';
+import { CLAUDE_CAPTURE_EVAL_MODEL } from '../lib/eval-model';
 
 // ---------------------------------------------------------------------------
 // Stub SDK event builders
@@ -47,7 +47,7 @@ function uuid(): string {
   return `00000000-0000-0000-0000-${String(++uuidCounter).padStart(12, '0')}`;
 }
 
-function systemInit(model = CLAUDE_FRONTIER_EVAL_MODEL, version = '2.1.117'): SDKMessage {
+function systemInit(model = CLAUDE_CAPTURE_EVAL_MODEL, version = '2.1.117'): SDKMessage {
   return {
     type: 'system',
     subtype: 'init',
@@ -213,7 +213,7 @@ function makeStubProvider(config: StubConfig): QueryProvider {
 }
 
 const BASE_OPTS = {
-  systemPrompt: '',
+  systemPrompt: { type: 'sdk-default', reason: 'stub queryProvider: no model reads the prompt' } as const,
   userPrompt: 'test prompt',
   workingDirectory: '/tmp/test-dir',
   maxRetries: 3,
@@ -261,7 +261,7 @@ describe('runAgentSdkTest — happy path', () => {
     expect(result.turnsUsed).toBe(2);
     expect(result.costUsd).toBe(0.05);
     expect(result.sdkClaudeCodeVersion).toBe('2.1.117');
-    expect(result.model).toBe(CLAUDE_FRONTIER_EVAL_MODEL);
+    expect(result.model).toBe(CLAUDE_CAPTURE_EVAL_MODEL);
     expect(result.firstResponseMs).toBeGreaterThanOrEqual(0);
   });
 
@@ -416,7 +416,7 @@ describe('runAgentSdkTest — options propagation', () => {
       calls: [],
     };
     await runAgentSdkTest({
-      systemPrompt: 'you are a test overlay',
+      systemPrompt: { type: 'custom', text: 'you are a test overlay', reason: 'checks that custom text reaches query()' },
       userPrompt: 'go',
       workingDirectory: '/tmp/spec-dir',
       model: 'claude-opus-4-7',
@@ -451,7 +451,7 @@ describe('runAgentSdkTest — options propagation', () => {
     expect(opts.pathToClaudeCodeExecutable).toBe('/fake/path/claude');
   });
 
-  test('empty systemPrompt means no systemPrompt option passed', async () => {
+  test('an sdk-default systemPrompt passes no systemPrompt option', async () => {
     freshSem();
     const stub: StubConfig = {
       streams: [[systemInit(), assistantTurn([{ type: 'text', text: 'ok' }]), resultSuccess()]],
@@ -461,7 +461,6 @@ describe('runAgentSdkTest — options propagation', () => {
       ...BASE_OPTS,
       queryProvider: makeStubProvider(stub),
     });
-    // systemPrompt is undefined when empty string passed (so SDK uses no override)
     expect(stub.calls[0]!.options!.systemPrompt).toBeUndefined();
   });
 });
@@ -738,6 +737,58 @@ describe('rate-limit detectors', () => {
 // ---------------------------------------------------------------------------
 
 describe('runAgentSdkTest — concurrency', () => {
+  test('admission runs only once across a rate-limit retry', async () => {
+    __resetSemaphoreForTests(1);
+    let admissions = 0;
+    const stub: StubConfig = {
+      streams: [[systemInit(), resultRateLimit()], [systemInit(), resultSuccess()]], calls: [],
+    };
+    await runAgentSdkTest({ ...BASE_OPTS, queryProvider: makeStubProvider(stub), maxRetries: 1,
+      onAdmission: () => { admissions++; } });
+    expect(admissions).toBe(1);
+    expect(stub.calls).toHaveLength(2);
+  });
+
+  test.each(['throw', 'abort'] as const)('admission %s prevents transport creation and releases its slot', async mode => {
+    __resetSemaphoreForTests(1);
+    const controller = new AbortController(), failure = new Error(`admission ${mode}`);
+    const stub: StubConfig = { streams: [[systemInit(), resultSuccess()]], calls: [] };
+    const queryProvider = makeStubProvider(stub);
+    const failed = runAgentSdkTest({ ...BASE_OPTS, queryProvider, signal: controller.signal,
+      onAdmission: () => { if (mode === 'throw') throw failure; controller.abort(failure); } });
+    const sibling = runAgentSdkTest({ ...BASE_OPTS, queryProvider });
+    const results = await Promise.allSettled([failed, sibling]);
+    expect(results[0]).toEqual({ status: 'rejected', reason: failure });
+    expect(results[1].status).toBe('fulfilled');
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  test('queued cancellation never calls admission or transport and leaves later siblings runnable', async () => {
+    __resetSemaphoreForTests(1);
+    const controller = new AbortController(), reason = new Error('queued cancellation');
+    let unblock!: () => void, started!: () => void;
+    const held = new Promise<void>(resolve => { unblock = resolve; });
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const provider: QueryProvider = () => (async function* () {
+      started(); await held; yield resultSuccess();
+    })() as unknown as Query;
+    const occupying = runAgentSdkTest({ ...BASE_OPTS, queryProvider: provider });
+    await ready;
+    let admissions = 0;
+    const stub: StubConfig = { streams: [[resultSuccess()]], calls: [] };
+    const queryProvider = makeStubProvider(stub);
+    const queued = runAgentSdkTest({ ...BASE_OPTS, queryProvider, signal: controller.signal,
+      onAdmission: () => { admissions++; } });
+    const sibling = runAgentSdkTest({ ...BASE_OPTS, queryProvider });
+    controller.abort(reason);
+    const cancelled = await Promise.allSettled([queued]);
+    expect(cancelled[0]).toEqual({ status: 'rejected', reason });
+    expect(admissions).toBe(0); expect(stub.calls).toHaveLength(0);
+    unblock();
+    await Promise.all([occupying, sibling]);
+    expect(stub.calls).toHaveLength(1);
+  });
+
   test('process-level semaphore caps concurrent queries', async () => {
     __resetSemaphoreForTests(2);
     let inFlight = 0;
@@ -793,7 +844,7 @@ describe('toSkillTestResult', () => {
     expect(s.output).toBe('hi');
     expect(s.costEstimate.estimatedCost).toBe(0.02);
     expect(s.costEstimate.turnsUsed).toBe(1);
-    expect(s.model).toBe(CLAUDE_FRONTIER_EVAL_MODEL);
+    expect(s.model).toBe(CLAUDE_CAPTURE_EVAL_MODEL);
     expect(s.firstResponseMs).toBeNumber();
     expect(s.maxInterTurnMs).toBeNumber();
     expect(s.transcript).toBeArray();

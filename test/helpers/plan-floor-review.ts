@@ -137,6 +137,14 @@ function deterministicPlanFloorSetup(input: PlanFloorReview): PlanFloorAssessmen
     /\b(?:developer|sdk developer|user)\b/.test(question) &&
     /\b(?:experiences|journey|narrative)\b/.test(question);
 
+  // plan-devex-review 0B's confirmation contract: the brief asks whether the
+  // narrative matches reality and every option is one of its three answers
+  // (accurate / some or partly wrong / way off). Any remedy option leaves it to the assessor.
+  const isDxNarrativeConfirmation =
+    /\b(?:empathy|narrative)\b/.test(header) &&
+    /\b(?:narrative|journey)\b[^?\n]*\bmatch\b[^?\n]*\?/.test(q.question.split(/\r?\n/)[0]!.toLowerCase()) &&
+    q.options.every(o => /^(?:[a-d][).:]\s*)?(?:(?:this is\s+)?accurate|(?:some|partly)\b[^,]*?\b(?:wrong|corrections?)|(?:this is\s+)?way off)\b/i.test(o.label.trim()));
+
   const isProductTypeSetup =
     header === 'product type' &&
     /^is this\b/.test(question) &&
@@ -146,7 +154,7 @@ function deterministicPlanFloorSetup(input: PlanFloorReview): PlanFloorAssessmen
     /^(?:mode|review mode)$/.test(header) &&
     /\b(?:which|what)\b.*\breview mode\b/.test(question);
 
-  if (!isDxEmpathySetup && !isProductTypeSetup && !isReviewModeSetup) return null;
+  if (!isDxEmpathySetup && !isDxNarrativeConfirmation && !isProductTypeSetup && !isReviewModeSetup) return null;
 
   return validatePlanFloorAssessment(input, {
     kind: 'setup',
@@ -163,13 +171,14 @@ function deterministicPlanFloorFinding(input: PlanFloorReview): PlanFloorAssessm
   const q = input.candidate.question;
   const combined = `${q.header}\n${q.question}`.replace(/\s+/g, ' ');
   const lower = combined.toLowerCase();
+  const journeyContext = lower.replace(/\btime[- ]to[- ]first[- ]call\b/g, '');
   const hasTthwTargetConcept =
     /\b(?:tthw|time-to-first-call|time to first call|time-to-hello-world|time to hello world)\b/.test(lower) ||
     (/\b(?:yardstick|score against|bar i compare|target is recorded)\b/.test(lower) &&
       /\b(?:under-?10|2-5|min|minutes|clock)\b/.test(lower));
   const isDevexTthwTarget =
     hasTthwTargetConcept &&
-    /\b(?:quickstart|first-call journey|sdk quickstart|onboarding flow|8-step onboarding|gap report)\b/.test(lower) &&
+    /\b(?:quickstart|onboarding flow|8-step onboarding|gap report|first(?:[- ](?:sdk|api|successful))*[- ]call)\b/.test(journeyContext) &&
     /\b(?:email|key|wait|unattended)\b/.test(lower) &&
     q.options.some(o => /(?:under|<)\s*10\s*min|measured wait|competitive|champion|current trajectory|copy-pasteable first call|key turnaround/i.test(`${o.label}\n${o.description}`));
   if (!isDevexTthwTarget) return null;
@@ -178,17 +187,13 @@ function deterministicPlanFloorFinding(input: PlanFloorReview): PlanFloorAssessm
     'Step 7: register an API key by emailing the team.',
     'No quickstart command, no hosted sandbox, no copy-pasteable curl example.',
   ].find(text => input.seed.includes(text));
-  const questionQuote = q.question.match(/Which (?:time-to-first-call|TTHW|Time-to-Hello-World) target should this quickstart (?:aim for|be measured against|be held to)\?/i)?.[0]
-    ?? q.question.match(/Which Time-to-Hello-World target fits this first-call journey\?/i)?.[0]
-    ?? q.question.match(/Which time-to-first-call target should this review (?:hold the plan to|aim the plan at)\?/i)?.[0]
-    ?? q.question.match(/Which yardstick should the gap report score against\?/i)?.[0];
-  const optionIndex = q.options.findIndex(o => /<\s*10\s*min|measured wait|competitive|champion|current trajectory|copy-pasteable first call|key turnaround/i.test(`${o.label}\n${o.description}`));
+  const firstLine = q.question.split(/\r?\n/)[0]!.trim();
+  const brief = firstLine.replace(/^D\d+(?:\s*\(re-ask\))?\s*[—–:-]\s*/i, '');
+  const currentQuestion = /^D\d+\s*\(re-ask\)/i.test(firstLine) ? brief.split(/\.\s+/).at(-1)! : brief;
+  const questionQuote = currentQuestion.match(/^(?:Which|What) (?:(?:time[- ]to[- ]first[- ](?:(?:SDK|API)[- ])?call|TTHW|time[- ]to[- ]hello[- ]world) target|yardstick|target(?= fits this journey\?$)) (?:should|fits)\b[^?]*\?$/i)?.[0];
+  const optionIndex = q.options.findIndex(o => /^(?:(?:under|<)\s*10\s*min\b|(?:champion|competitive|current trajectory)(?=$|\s*[(,]))/i.test(o.label.replace(/^[A-D][).:]\s*/, '').trim()));
   const option = optionIndex >= 0 ? q.options[optionIndex] : undefined;
-  const optionQuote = option && /<\s*10\s*min/i.test(option.label) ? option.label
-    : option && /competitive|champion|current trajectory/i.test(option.label) ? option.label
-    : option?.description.match(/[^.]*?(?:under|<)\s*10\s*min[^.]*\./i)?.[0]
-      ?? option?.description.match(/[^.]*copy-pasteable first call[^.]*\./i)?.[0]
-      ?? option?.description.match(/[^.]*measured wait[^.]*\./i)?.[0];
+  const optionQuote = option?.label;
   if (!seedQuote || !questionQuote || optionIndex < 0 || !optionQuote) return null;
 
   return validatePlanFloorAssessment(input, {
@@ -201,7 +206,13 @@ function deterministicPlanFloorFinding(input: PlanFloorReview): PlanFloorAssessm
   });
 }
 
-/** Same warmup CLI, one turn and 30s cap as the replaced waiting-state judge.
+/** Per-call cap on the warmup-model assessment. Measured 2026-10-03 with
+ * Claude Code 2.1.284 and claude-haiku-4-5 on the committed captured inputs:
+ * 25 calls (10 sequential, 15 at 3-way concurrency), p50 14.7s, p95 27.4s,
+ * max 31.3s, so the old 30s cap cut the tail. 90s is about 3x p95. */
+export const PLAN_FLOOR_ASSESSMENT_CAP_MS = 90_000;
+
+/** Same warmup CLI and one turn as the replaced waiting-state judge.
  * The original case deadline bounds each call; complete input is never truncated. */
 export function judgePlanFloorReview(input: PlanFloorReview, opts: {
   binary: string; model: string; deadlineAt: number;
@@ -220,7 +231,7 @@ export function judgePlanFloorReview(input: PlanFloorReview, opts: {
   try {
     const result = (opts.invoke ?? spawnSync)(opts.binary,
       ['-p', '--model', opts.model, '--max-turns', '1'],
-      { input: prompt, stdio: ['pipe', 'pipe', 'pipe'], timeout: Math.min(30_000, remaining), encoding: 'utf8' });
+      { input: prompt, stdio: ['pipe', 'pipe', 'pipe'], timeout: Math.min(PLAN_FLOOR_ASSESSMENT_CAP_MS, remaining), encoding: 'utf8' });
     Object.assign(diagnostic, { rawOutput: String(result.stdout ?? ''), stderr: String(result.stderr ?? ''), status: result.status });
     if (result.error || result.status !== 0 || Date.now() >= opts.deadlineAt)
       throw Error(`Floor assessment did not complete: ${result.error?.message ?? `exit ${result.status}`} ${String(result.stderr ?? '').slice(-3000)}`.trim());

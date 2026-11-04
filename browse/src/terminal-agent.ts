@@ -29,8 +29,9 @@ import { safeUnlink } from './error-handling';
 import { writeAgentRecord, readAgentRecord, clearAgentRecord, readAgentStartTime, acquireAgentStateLock } from './terminal-agent-control';
 import { findAvailablePort } from './port-allocator';
 import { extractPtyCookie } from './pty-session-cookie';
+import { allowedExtensionOrigin } from './extension-id';
 import {
-  createPtyLifecycle, disposePtyProcess, ptyCompletionReason,
+  createPtyLifecycle, disposePtyProcess, ptyCompletionReason, PTY_SHUTDOWN_GRACE_MS,
   type PtyCompletion, type PtyLifecycle,
 } from './terminal-pty-lifecycle';
 
@@ -43,7 +44,6 @@ const OWNER_WATCHDOG_MS = parseInt(
   process.env.GSTACK_TERMINAL_OWNER_WATCHDOG_MS || '15000',
   10,
 );
-const EXTENSION_ID = process.env.BROWSE_EXTENSION_ID || ''; // optional: tighten Origin check
 const INTERNAL_TOKEN = crypto.randomBytes(32).toString('base64url'); // shared with parent server via env at spawn
 /**
  * Per-boot generation identifier. Loopback /internal/* callers include
@@ -83,15 +83,10 @@ const sessionsById = new Map<string, PtySession>();
 // Active PTY session per WS. One terminal per connection. Codex finding #4:
 // uncaught handlers below catch bugs in framing/cleanup so they don't kill
 // the listener loop.
-process.on('uncaughtException', (err) => {
-  console.error('[terminal-agent] uncaughtException:', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[terminal-agent] unhandledRejection:', reason);
-});
-
 export interface PtySession {
   proc: any | null;        // Bun.Subprocess once spawned
+  /** Spawn-time identity of the PTY's process group; outlives the leader so shutdown can reap HUP-immune descendants. */
+  group?: PtyGroupIdentity | null;
   lifecycle?: PtyLifecycle | null;
   completion?: PtyCompletion;
   disposed?: boolean;
@@ -244,6 +239,64 @@ export function buildReplayPayload(session: PtySession): Buffer {
 }
 
 const sessions = new WeakMap<any, PtySession>(); // ws -> session
+// Strong ownership index for shutdown. sessions is intentionally weak and
+// sessionsById excludes legacy grants, so neither can enumerate every PTY
+// child when the terminal-agent is replaced or its owner disappears.
+const activeSessions = new Set<PtySession>();
+// Set once shutdown starts: no new connection or PTY spawn during the grace.
+let shuttingDown = false;
+// Groups of disposed sessions whose delayed reap has not run yet; shutdown reaps them too.
+const pendingGroupReaps = new Set<PtyGroupIdentity>();
+
+/**
+ * A PTY child is its own session and process-group leader (pgid = sid =
+ * pid). That identity, with the leader's start time, stays checkable after
+ * the leader exits, so descendants that ignore SIGHUP can still be found.
+ */
+export interface PtyGroupIdentity { pgid: number; sid: number; startTime: number }
+interface ProcStat { state: string; pgrp: number; session: number; startTime: number }
+
+/** Linux /proc/<pid>/stat fields after the parenthesised comm; null when absent (or not Linux). */
+export function readProcStat(pid: number, procRoot = '/proc'): ProcStat | null {
+  let raw: string;
+  try { raw = fs.readFileSync(path.join(procRoot, String(pid), 'stat'), 'utf8'); } catch { return null; }
+  const f = raw.slice(raw.lastIndexOf(')') + 2).split(' ');
+  const stat = { state: f[0] ?? '', pgrp: Number(f[2]), session: Number(f[3]), startTime: Number(f[19]) };
+  return Number.isSafeInteger(stat.pgrp) && Number.isSafeInteger(stat.session) && Number.isSafeInteger(stat.startTime) ? stat : null;
+}
+
+/** The group identity of a freshly spawned PTY child, or null unless it provably leads its own session. */
+export function ptyGroupIdentity(pid: number, procRoot = '/proc'): PtyGroupIdentity | null {
+  const stat = readProcStat(pid, procRoot);
+  if (!stat || stat.pgrp !== pid || stat.session !== pid) return null;
+  return { pgid: pid, sid: pid, startTime: stat.startTime };
+}
+
+/**
+ * Live processes proven to belong to the group: same pgid and sid, started
+ * no earlier than its leader. A live process holding the leader's PID with
+ * another start time means the number was reused, so nothing is ours.
+ */
+export function ownedGroupMembers(id: PtyGroupIdentity, procRoot = '/proc'): number[] {
+  const leader = readProcStat(id.pgid, procRoot);
+  if (leader && leader.startTime !== id.startTime) return [];
+  let entries: string[];
+  try { entries = fs.readdirSync(procRoot); } catch { return []; }
+  const members: number[] = [];
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue;
+    const stat = readProcStat(Number(name), procRoot);
+    if (stat && stat.state !== 'Z' && stat.pgrp === id.pgid && stat.session === id.sid && stat.startTime >= id.startTime) members.push(Number(name));
+  }
+  return members;
+}
+
+/** SIGKILL every proven member of the group; returns how many were signalled. */
+export function reapOwnedGroup(id: PtyGroupIdentity, procRoot = '/proc', kill: (pid: number, signal: string) => void = process.kill): number {
+  const members = ownedGroupMembers(id, procRoot);
+  for (const pid of members) { try { kill(pid, 'SIGKILL'); } catch {} }
+  return members.length;
+}
 
 /** Find claude on PATH. */
 function findClaude(): string | null {
@@ -308,11 +361,12 @@ function buildTabAwarenessHint(stateDir: string): string {
     'You are running inside the gstack browser sidebar with live access to the user\'s browser tabs.',
     '',
     'Tab state files (kept fresh automatically by the extension):',
-    `  ${tabsFile}        — all open tabs (id, url, title, active, pinned)`,
-    `  ${activeFile}    — the currently active tab`,
-    'Read these any time the user asks about "tabs", "the current page", or anything multi-tab. Do NOT shell out to $B tabs just to learn what\'s open — read the file.',
+    `  ${tabsFile}        — all open tabs: tabs[] of {tabId, url, title, active, pinned, windowId}`,
+    `  ${activeFile}    — the currently active tab: {tabId, url, title}`,
+    'Read these any time the user asks about "tabs", "the current page", or anything multi-tab. They\'re kept current, so read them instead of running $B tabs when you only need to know what\'s open.',
     '',
     'Tab manipulation commands (via $B):',
+    '  ($B is the gstack browse CLI. This shell does not set it, so resolve it the way the /browse skill does: the project\'s .claude/skills/gstack/browse/dist/browse if present, else ~/.claude/skills/gstack/browse/dist/browse.)',
     '  $B tab <id>                 — switch to a tab',
     '  $B newtab [url]             — open a new tab',
     '  $B closetab [id]            — close a tab (current if no id)',
@@ -342,6 +396,7 @@ function spawnClaude(cols: number, rows: number, lifecycle: PtyLifecycle) {
     BROWSE_STATE_FILE: STATE_FILE,
     BROWSE_NO_AUTOSTART: '1',
     BROWSE_HEADED: '1',
+    BROWSE_SESSION: '',
     TERM: 'xterm-256color',
     COLORTERM: 'truecolor',
   };
@@ -371,6 +426,8 @@ function spawnClaude(cols: number, rows: number, lifecycle: PtyLifecycle) {
 
 /** Cleanup a PTY session: SIGINT, then SIGKILL after 3s. */
 function disposeSession(session: PtySession): void {
+  if (session.disposed) return;
+  activeSessions.delete(session);
   // Suppress callbacks caused by explicit close, and cancel any drain deadline.
   session.disposed = true;
   session.lifecycle?.dispose();
@@ -379,6 +436,12 @@ function disposeSession(session: PtySession): void {
   session.proc = null;
   session.spawned = false;
   disposePtyProcess(proc);
+  // Unlike the direct-child fallback, the group reap is not cancelled when
+  // the leader exits: a descendant that ignores SIGHUP outlives it.
+  const group = session.group;
+  if (!group) return;
+  pendingGroupReaps.add(group);
+  setTimeout(() => { pendingGroupReaps.delete(group); reapOwnedGroup(group); }, PTY_SHUTDOWN_GRACE_MS).unref?.();
 }
 
 function sendPtyCompletion(session: PtySession): void {
@@ -462,7 +525,7 @@ async function internalHandler<T>(
  * surfaced the error to the client (or will via the next frame).
  */
 function maybeSpawnPty(ws: any, session: PtySession): boolean {
-  if (session.disposed || session.completion) return false;
+  if (shuttingDown || session.disposed || session.completion) return false;
   if (session.spawned) return true;
   session.spawned = true;
   let leftover = Buffer.alloc(0);
@@ -516,6 +579,7 @@ function maybeSpawnPty(ws: any, session: PtySession): boolean {
     return false;
   }
   session.proc = proc;
+  session.group = ptyGroupIdentity(proc.pid);
   proc.exited.then(
     (code: number) => lifecycle.exited(code, proc.signalCode ?? null),
     () => lifecycle.exited(null, proc.signalCode ?? null, true),
@@ -523,8 +587,13 @@ function maybeSpawnPty(ws: any, session: PtySession): boolean {
   return true;
 }
 
+interface TerminalAgentWsData {
+  cookie: string;
+  sessionId: string | null;
+}
+
 function buildServer(port: number) {
-  return Bun.serve({
+  return Bun.serve<TerminalAgentWsData>({
     hostname: '127.0.0.1',
     // #2314: allocated from the SAME fixed 10000-60000 scan range the main
     // server uses (port-allocator.ts, decision 8) — never `port: 0`. Binding
@@ -535,6 +604,7 @@ function buildServer(port: number) {
     idleTimeout: 0, // PTY connections are long-lived; default idleTimeout would kill them
 
     fetch(req, server) {
+      if (shuttingDown) return new Response('shutting down', { status: 503 });
       const url = new URL(req.url);
 
       // /internal/grant — loopback-only handshake from parent server.
@@ -621,8 +691,8 @@ function buildServer(port: number) {
       }
 
       // /ws — WebSocket upgrade. CRITICAL gates:
-      //   (1) Origin must be chrome-extension://<id>. Cross-site WS hijacking
-      //       defense — required, not optional.
+      //   (1) Origin must be exactly the pinned (or gstack-config configured)
+      //       extension. Any other origin, other extensions included, is 403.
       //   (2) Token must be in validTokens. We accept the token via two
       //       transports for compatibility:
       //         - Sec-WebSocket-Protocol (preferred for browsers — the only
@@ -635,12 +705,7 @@ function buildServer(port: number) {
       //       validTokens Set, populated by the parent server's
       //       authenticated /pty-session → /internal/grant chain.
       if (url.pathname === '/ws') {
-        const origin = req.headers.get('origin') || '';
-        const isExtensionOrigin = origin.startsWith('chrome-extension://');
-        if (!isExtensionOrigin) {
-          return new Response('forbidden origin', { status: 403 });
-        }
-        if (EXTENSION_ID && origin !== `chrome-extension://${EXTENSION_ID}`) {
+        if (req.headers.get('origin') !== allowedExtensionOrigin()) {
           return new Response('forbidden origin', { status: 403 });
         }
 
@@ -702,8 +767,8 @@ function buildServer(port: number) {
        * after `spawned: true` is a no-op.
        */
       open(ws) {
-        const sessionId = (ws.data as any)?.sessionId ?? null;
-        const cookie = (ws.data as any)?.cookie || '';
+        const sessionId = ws.data?.sessionId ?? null;
+        const cookie = ws.data?.cookie || '';
 
         // Commit 3 re-attach: if this sessionId already has a detached
         // PtySession in sessionsById, REPLACE its liveWs ref and replay
@@ -754,6 +819,7 @@ function buildServer(port: number) {
           detached: false,
           detachTimer: null,
         };
+        activeSessions.add(session);
         session.pingInterval = setInterval(() => {
           try {
             ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
@@ -777,9 +843,9 @@ function buildServer(port: number) {
             proc: null,
             cols: 80,
             rows: 24,
-            cookie: (ws.data as any)?.cookie || '',
+            cookie: ws.data?.cookie || '',
             liveWs: ws,
-            sessionId: (ws.data as any)?.sessionId ?? null,
+            sessionId: ws.data?.sessionId ?? null,
             spawned: false,
             pingInterval: null,
             ringBuffer: [],
@@ -788,6 +854,7 @@ function buildServer(port: number) {
             detached: false,
             detachTimer: null,
           };
+          activeSessions.add(session);
           sessions.set(ws, session);
           if (session.sessionId) sessionsById.set(session.sessionId, session);
         }
@@ -857,7 +924,7 @@ function buildServer(port: number) {
         // Always drop the WS-keyed map entry and the per-attach
         // attachToken — the attach grant was single-use.
         sessions.delete(ws);
-        const cookie = (ws.data as any)?.cookie;
+        const cookie = ws.data?.cookie;
         if (cookie) validTokens.delete(cookie);
         // A reattach can replace liveWs before the old socket's close arrives.
         // That stale callback must not retire the new socket, grant or child.
@@ -1052,7 +1119,7 @@ async function main() {
 
   // Write port file atomically so the parent server can pick it up.
   // Throws on failure — a boot without a discoverable port file is broken.
-  const releasePublication = acquireAgentStateLock(dir);
+  const releasePublication = acquireAgentStateLock(dir, 5000, process.env.BROWSE_AGENT_GEN);
   let record;
   try {
     const current = readAgentRecord(dir);
@@ -1076,9 +1143,20 @@ async function main() {
 
   // Cleanup port file + agent record on exit.
   let cleaningUp = false;
-  const cleanup = () => {
+  const cleanup = async () => {
     if (cleaningUp) return;
     cleaningUp = true;
+    shuttingDown = true;
+    // disposePtyProcess sends SIGINT and schedules the direct child's SIGKILL
+    // fallback. Each PTY's process group, captured at spawn, is reaped after
+    // the same grace even when its leader exits first, so descendants that
+    // ignore SIGHUP do not outlive the agent. Awaiting here keeps both alive
+    // instead of process.exit(0) abandoning them.
+    const owned = [...activeSessions];
+    const childExits = owned.map(session => session.proc?.exited).filter((exited): exited is Promise<number> => !!exited);
+    for (const session of owned) disposeSession(session);
+    const groups = [...pendingGroupReaps];
+    sessionsById.clear();
     try {
       const releaseCleanup = acquireAgentStateLock(dir, 25);
       try {
@@ -1089,10 +1167,16 @@ async function main() {
         }
       } finally { releaseCleanup(); }
     } catch {}
+    let childrenExited = childExits.length === 0;
+    void Promise.allSettled(childExits).then(() => { childrenExited = true; });
+    const deadline = Date.now() + PTY_SHUTDOWN_GRACE_MS;
+    while (Date.now() < deadline && !(childrenExited && groups.every(group => ownedGroupMembers(group).length === 0))) await Bun.sleep(100);
+    for (const group of groups) reapOwnedGroup(group);
+    if (!childrenExited) await Promise.race([Promise.allSettled(childExits), Bun.sleep(250)]);
     process.exit(0);
   };
-  process.on('SIGTERM', cleanup);
-  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', () => { void cleanup(); });
+  process.on('SIGINT', () => { void cleanup(); });
 
   // The terminal agent is intentionally detached so it survives the short-lived
   // CLI launcher, but its real owner is the persistent browse server. If that
@@ -1102,7 +1186,7 @@ async function main() {
   if (BROWSE_OWNER_PID > 0) {
     const ownerWatchdog = setInterval(() => {
       if (!BROWSE_OWNER_START_TIME || readAgentStartTime(BROWSE_OWNER_PID) !== BROWSE_OWNER_START_TIME
-        || readAgentRecord(dir)?.gen !== CURRENT_GEN) cleanup();
+        || readAgentRecord(dir)?.gen !== CURRENT_GEN) void cleanup();
     }, OWNER_WATCHDOG_MS);
     (ownerWatchdog as any)?.unref?.();
   }
@@ -1116,7 +1200,15 @@ async function main() {
 // to a state file the parent reads. This avoids env-passing races. See main().
 const INTERNAL_TOKEN_FILE = path.join(path.dirname(STATE_FILE), 'terminal-internal-token');
 
-main().catch((err) => {
-  console.error(`[terminal-agent] boot failed: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  process.on('uncaughtException', (err) => {
+    console.error('[terminal-agent] uncaughtException:', err);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[terminal-agent] unhandledRejection:', reason);
+  });
+  main().catch((err) => {
+    console.error(`[terminal-agent] boot failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}
