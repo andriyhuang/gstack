@@ -68,7 +68,7 @@ function runImport(sessionPath: string): { stdout: string; stderr: string; statu
   env.GSTACK_STATE_ROOT = stateRoot;
   env.GSTACK_QUESTION_LOG_NO_DERIVE = '1';
   delete env.GSTACK_HOME;
-  const res = spawnSync(BIN, [sessionPath], { env, encoding: 'utf-8', cwd: ROOT });
+  const res = spawnSync(BIN, [sessionPath], { env, encoding: 'utf-8', cwd: ROOT, timeout: 30_000 });
   return {
     stdout: res.stdout ?? '',
     stderr: res.stderr ?? '',
@@ -108,6 +108,18 @@ describe('marker-first import (source=codex-import-marker)', () => {
     expect(events[0].question_id).toBe('ship-test-failure-triage');
     expect(events[0].user_choice).toContain('Fix now');
     expect(events[0].recommended).toContain('Fix now');
+  });
+
+  test('carries a marker signal hint into the log (#3442)', () => {
+    const sessionPath = writeSessionFile([
+      agentMessage('D1 — Caching\n<gstack-qid:plan-ceo-review-add-caching;signal=scope-appetite> Add caching?\nA) Expand with caching (recommended)\nB) Hold scope'),
+      userMessage('A'),
+    ]);
+    expect(runImport(sessionPath).status).toBe(0);
+    const events = readImportedEvents();
+    expect(events[0].question_id).toBe('plan-ceo-review-add-caching');
+    expect(events[0].signal_key).toBe('scope-appetite');
+    expect(events[0].user_choice).toBe('expand');
   });
 });
 
@@ -196,7 +208,7 @@ describe('default mode (no args → latest)', () => {
       }
       env.GSTACK_STATE_ROOT = stateRoot;
       env.CODEX_SESSIONS_ROOT = emptyDir;
-      const res = spawnSync(BIN, [], { env, encoding: 'utf-8', cwd: ROOT });
+      const res = spawnSync(BIN, [], { env, encoding: 'utf-8', cwd: ROOT, timeout: 30_000 });
       expect(res.status).toBe(0);
       expect(res.stdout).toMatch(/NO_SESSIONS/);
     } finally {

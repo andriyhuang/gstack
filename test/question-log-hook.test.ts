@@ -19,6 +19,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { spawnSync } from 'child_process';
+import { hookChildBudgetMs } from '../hosts/claude/hooks/spawn-bin';
+import { launchSkipReason } from '../hosts/claude/hooks/question-log-hook.ts';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const HOOK = path.join(ROOT, 'hosts', 'claude', 'hooks', 'question-log-hook');
@@ -48,6 +50,7 @@ function runHook(stdin: object): { stdout: string; stderr: string; status: numbe
     input: JSON.stringify(stdin),
     encoding: 'utf-8',
     cwd: ROOT,
+    timeout: 30_000,
   });
   return {
     stdout: res.stdout ?? '',
@@ -135,6 +138,115 @@ describe('PostToolUse hook (native AskUserQuestion)', () => {
     expect(events[0].question_id).toBe('ship-test-failure-triage');
     // Marker stripped from summary
     expect((events[0].question_summary as string).includes('<gstack-qid:')).toBe(false);
+  });
+
+  test('a signal hint in the marker reaches the log row (#3442)', () => {
+    runHook({
+      session_id: 'sess-hint',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-hint',
+      tool_input: {
+        questions: [
+          {
+            question: 'D3 — Add caching? <gstack-qid:plan-ceo-review-add-caching;signal=scope-appetite>',
+            options: ['A) Expand to add caching (recommended)', 'B) Hold scope'],
+          },
+        ],
+      },
+      tool_response: { answers: [{ option_label: 'A) Expand to add caching (recommended)' }] },
+      cwd: ROOT,
+    });
+    const events = readLog();
+    expect(events.length).toBe(1);
+    expect(events[0].question_id).toBe('plan-ceo-review-add-caching');
+    expect(events[0].signal_key).toBe('scope-appetite');
+    expect(events[0].user_choice).toBe('expand');
+    expect((events[0].question_summary as string).includes('gstack-qid')).toBe(false);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Shape D: current native AUQ result — answers object keyed by question text
+// ----------------------------------------------------------------------
+
+describe('PostToolUse hook (Shape D: answers object keyed by question text)', () => {
+  test('captures user_choice from the answers map, stripping the (Recommended) suffix', () => {
+    const qText = 'D-shape test: apply the edits?';
+    runHook({
+      session_id: 'sessD1',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-d1',
+      tool_input: {
+        questions: [
+          { question: qText, options: [{ label: 'Full revision (Recommended)' }, { label: 'Hold' }] },
+        ],
+      },
+      tool_response: { answers: { [qText]: 'Full revision (Recommended)' } },
+      cwd: ROOT,
+    });
+    const events = readLog();
+    expect(events.length).toBe(1);
+    expect(events[0].user_choice).toBe('Full revision');
+    expect(events[0].recommended).toBe('Full revision');
+    expect(events[0].followed_recommendation).toBe(true);
+  });
+
+  test('free-text answer (not an option label) → source=auq-other with free_text', () => {
+    const qText = 'D-shape free text test';
+    runHook({
+      session_id: 'sessD2',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-d2',
+      tool_input: {
+        questions: [{ question: qText, options: [{ label: 'Alpha' }, { label: 'Beta' }] }],
+      },
+      tool_response: { answers: { [qText]: 'I cannot see what the proposal is' } },
+      cwd: ROOT,
+    });
+    const events = readLog();
+    expect(events.length).toBe(1);
+    expect(events[0].source).toBe('auq-other');
+    expect(events[0].free_text).toContain('cannot see');
+  });
+
+  test('annotations notes are captured as free_text alongside a selected option', () => {
+    const qText = 'D-shape annotations test';
+    runHook({
+      session_id: 'sessD3',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-d3',
+      tool_input: {
+        questions: [{ question: qText, options: [{ label: 'Alpha' }, { label: 'Beta' }] }],
+      },
+      tool_response: {
+        answers: { [qText]: 'Alpha' },
+        annotations: { [qText]: { notes: 'but only after the demo' } },
+      },
+      cwd: ROOT,
+    });
+    const events = readLog();
+    expect(events.length).toBe(1);
+    expect(events[0].user_choice).toBe('Alpha');
+    expect(events[0].free_text).toContain('after the demo');
+  });
+
+  test('empty tool_response → user_choice __unknown__ and NO followed_recommendation', () => {
+    runHook({
+      session_id: 'sessD4',
+      tool_name: 'AskUserQuestion',
+      tool_use_id: 'tu-d4',
+      tool_input: {
+        questions: [
+          { question: 'D-shape unknown test', options: [{ label: 'Alpha (Recommended)' }, { label: 'Beta' }] },
+        ],
+      },
+      cwd: ROOT,
+    });
+    const events = readLog();
+    expect(events.length).toBe(1);
+    expect(events[0].user_choice).toBe('__unknown__');
+    expect(events[0].recommended).toBe('Alpha');
+    expect(events[0].followed_recommendation).toBeUndefined();
   });
 });
 
@@ -260,7 +372,7 @@ describe('PostToolUse hook (crash safety)', () => {
     }
     env.GSTACK_STATE_ROOT = stateRoot;
     env.GSTACK_QUESTION_LOG_NO_DERIVE = '1';
-    const res = spawnSync(HOOK, [], { env, input: '', encoding: 'utf-8' });
+    const res = spawnSync(HOOK, [], { env, input: '', encoding: 'utf-8', timeout: 30_000 });
     expect(res.status).toBe(0);
   });
 
@@ -275,6 +387,7 @@ describe('PostToolUse hook (crash safety)', () => {
       env,
       input: 'not json',
       encoding: 'utf-8',
+      timeout: 30_000,
     });
     expect(res.status).toBe(0);
     // Error logged to hook-errors.log
@@ -282,4 +395,60 @@ describe('PostToolUse hook (crash safety)', () => {
     expect(fs.existsSync(errLog)).toBe(true);
     expect(fs.readFileSync(errLog, 'utf-8')).toContain('stdin parse failed');
   });
+});
+
+// ----------------------------------------------------------------------
+// One budget for every child (Claude Code kills the hook at 5 s)
+// ----------------------------------------------------------------------
+
+describe('PostToolUse hook (budget)', () => {
+  test('every child shares the registered 5 s budget, less the exit reserve', () => {
+    expect(hookChildBudgetMs(1_000, 1_000)).toBe(4_500);
+    expect(hookChildBudgetMs(1_000, 3_000)).toBe(2_500);
+    expect(hookChildBudgetMs(1_000, 6_000)).toBeLessThan(0);
+  });
+
+  test('a call launches only with at least 250 ms of budget left', () => {
+    expect(launchSkipReason(4_500)).toBeNull();
+    expect(launchSkipReason(250)).toBeNull();
+    expect(launchSkipReason(249)).toBe("the hook's 5000 ms budget is spent (249 ms left, under the 250 ms a call needs)");
+    expect(launchSkipReason(-40)).toBe("the hook's 5000 ms budget is spent (0 ms left, under the 250 ms a call needs)");
+  });
+
+  test('slow children stop at the hook budget and the skipped questions are logged', () => {
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-slow-bun-'));
+    try {
+      fs.writeFileSync(path.join(fakeBin, 'bun'), `#!/bin/sh\nsleep 5\nexec "${process.execPath}" "$@"\n`, { mode: 0o755 });
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) {
+        if (v !== undefined) env[k] = v;
+      }
+      env.GSTACK_STATE_ROOT = stateRoot;
+      delete env.GSTACK_HOME;
+      env.GSTACK_QUESTION_LOG_NO_DERIVE = '1';
+      env.PATH = `${fakeBin}${path.delimiter}${env.PATH ?? ''}`;
+      const questions = Array.from({ length: 6 }, (_, i) => ({ question: `Budget question ${i}`, options: ['A', 'B'] }));
+      const res = spawnSync(process.execPath, [path.join(ROOT, 'hosts', 'claude', 'hooks', 'question-log-hook.ts')], {
+        env,
+        input: JSON.stringify({
+          session_id: 'budget',
+          tool_name: 'AskUserQuestion',
+          tool_use_id: 'tu-budget',
+          tool_input: { questions },
+          tool_response: { answers: questions.map(() => ({ option_label: 'A' })) },
+          cwd: ROOT,
+        }),
+        encoding: 'utf-8',
+        cwd: ROOT,
+        timeout: 30_000,
+      });
+      expect(res.status).toBe(0);
+      expect(readLog().length).toBeLessThan(questions.length);
+      const errors = fs.readFileSync(path.join(stateRoot, 'hook-errors.log'), 'utf-8');
+      expect(errors).toMatch(/exited null \(SIG\w+ after \d+ of \d+ ms\)/);
+      expect(errors).toContain('budget is spent');
+    } finally {
+      fs.rmSync(fakeBin, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

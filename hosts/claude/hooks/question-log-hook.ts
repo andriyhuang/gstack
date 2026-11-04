@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * PostToolUse hook for AskUserQuestion (Claude Code, plan-tune cathedral T5).
  *
@@ -35,8 +35,11 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { spawnSync } from 'child_process';
+import { HOOK_TIMEOUT_MS, hookChildBudgetMs, runBin } from './spawn-bin';
+import { logHookError as sharedLogHookError } from './hook-log';
+import { parseQidMarker } from '../../../scripts/qid-marker';
+import { resolveWindowsBashCached } from '../../../lib/script-invocation';
+import { resolveStateRoot } from '../../../lib/state-root';
 
 interface HookStdin {
   session_id?: string;
@@ -65,23 +68,19 @@ interface ExtractedQuestion {
   door_type?: string;
 }
 
-const MARKER_RE = /<gstack-qid:([a-z0-9-]{1,64})>/i;
 const RECOMMENDED_LABEL_RE = /\(recommended\)\s*$/i;
+const HOOK_STARTED_AT = Date.now() - Math.round(process.uptime() * 1000);
+/** Below this much budget a child cannot launch and finish, so the hook skips it instead of starting a call it must kill. */
+const MIN_LAUNCH_BUDGET_MS = 250;
+
+/** Why the next gstack-question-log call is skipped with `budgetMs` left, or null when it may launch. */
+export function launchSkipReason(budgetMs: number): string | null {
+  if (budgetMs >= MIN_LAUNCH_BUDGET_MS) return null;
+  return `the hook's ${HOOK_TIMEOUT_MS} ms budget is spent (${Math.max(0, budgetMs)} ms left, under the ${MIN_LAUNCH_BUDGET_MS} ms a call needs)`;
+}
 
 function logHookError(msg: string): void {
-  try {
-    const stateRoot =
-      process.env.GSTACK_STATE_ROOT ||
-      process.env.GSTACK_HOME ||
-      path.join(os.homedir(), '.gstack');
-    fs.mkdirSync(stateRoot, { recursive: true });
-    fs.appendFileSync(
-      path.join(stateRoot, 'hook-errors.log'),
-      `${new Date().toISOString()} question-log-hook: ${msg}\n`,
-    );
-  } catch {
-    // Last-resort: swallow. Hook must not block.
-  }
+  sharedLogHookError('question-log-hook', msg);
 }
 
 function readStdin(): Promise<string> {
@@ -115,13 +114,14 @@ function extractQuestionId(
   skill: string,
   questionText: string,
   options: string[],
-): { id: string; marker_present: boolean; stripped_question: string } {
-  const match = questionText.match(MARKER_RE);
-  if (match) {
+): { id: string; signal_key?: string; marker_present: boolean; stripped_question: string } {
+  const marker = parseQidMarker(questionText);
+  if (marker) {
     return {
-      id: match[1],
+      id: marker.id,
+      ...(marker.signal_key ? { signal_key: marker.signal_key } : {}),
       marker_present: true,
-      stripped_question: questionText.replace(MARKER_RE, '').trim(),
+      stripped_question: marker.stripped,
     };
   }
   return {
@@ -156,21 +156,63 @@ function extractRecommended(questionText: string, opts: string[]): string | unde
  * AUQ tool_response shape varies by Claude Code variant (native vs MCP),
  * and the hook stdin docs don't pin a single canonical shape. We handle
  * the common cases gracefully.
+ *
+ * Shape D is the current native AskUserQuestion result:
+ *   { answers: { "<question text>": "<answer>" },
+ *     annotations?: { "<question text>": { notes?, preview? } } }
+ * The map is keyed by the question text exactly as passed in tool_input,
+ * so extraction needs the questions themselves, not just a count.
  */
 function extractUserChoices(
   response: unknown,
-  questionCount: number,
+  questions: Array<{ question?: string; options?: Array<string | { label?: string; description?: string }> }>,
+  diag?: (msg: string) => void,
 ): Array<{ choice: string; free_text?: string }> {
+  const questionCount = questions.length;
   const out: Array<{ choice: string; free_text?: string }> = [];
   if (!response) {
+    diag?.(`answer-extract: empty tool_response (typeof=${typeof response})`);
     for (let i = 0; i < questionCount; i++) out.push({ choice: '__unknown__' });
     return out;
   }
-  // Shape A: { answers: [{option_label, free_text?}] }
-  // Shape B: { questions: [{user_answer}] }
-  // Shape C: { content: [...] } or array.
-  // We probe lazily.
   const rec = response as Record<string, unknown>;
+  // Shape D: { answers: {questionText: answer}, annotations?: {questionText: {notes}} }
+  if (rec.answers && typeof rec.answers === 'object' && !Array.isArray(rec.answers)) {
+    const answers = rec.answers as Record<string, unknown>;
+    const annotations =
+      rec.annotations && typeof rec.annotations === 'object' && !Array.isArray(rec.annotations)
+        ? (rec.annotations as Record<string, Record<string, unknown>>)
+        : {};
+    const keys = Object.keys(answers);
+    const norm = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+    for (const q of questions) {
+      const qText = q.question || '';
+      let key: string | undefined = Object.prototype.hasOwnProperty.call(answers, qText)
+        ? qText
+        : keys.find((k) => norm(k) === norm(qText));
+      // Single question, single answer: pair them even if the key drifted.
+      if (key === undefined && keys.length === 1 && questionCount === 1) key = keys[0];
+      if (key === undefined) {
+        diag?.(`answer-extract: no answers key matched question "${qText.slice(0, 60)}"`);
+        out.push({ choice: '__unknown__' });
+        continue;
+      }
+      const v = answers[key];
+      const rawChoice = Array.isArray(v) ? v.map(String).join(', ') : String(v ?? '__unknown__');
+      // The bin compares user_choice === recommended, and recommended is
+      // stored with the "(recommended)" suffix stripped — strip it here too.
+      const choice = rawChoice.replace(RECOMMENDED_LABEL_RE, '').trim() || '__unknown__';
+      const labels = optionLabels(q.options || []).map((l) =>
+        l.replace(RECOMMENDED_LABEL_RE, '').trim().toLowerCase(),
+      );
+      const notes = annotations[key]?.notes;
+      const isFreeText = !Array.isArray(v) && labels.length > 0 && !labels.includes(choice.toLowerCase());
+      const freeText = notes !== undefined ? String(notes) : isFreeText ? rawChoice : undefined;
+      out.push(freeText !== undefined ? { choice, free_text: freeText } : { choice });
+    }
+    return out;
+  }
+  // Shape A: { answers: [{option_label, free_text?}] }
   if (Array.isArray(rec.answers)) {
     for (const a of rec.answers as Array<Record<string, unknown>>) {
       const choice = (a.option_label || a.label || a.choice || a.answer || '__unknown__') as string;
@@ -180,6 +222,7 @@ function extractUserChoices(
     while (out.length < questionCount) out.push({ choice: '__unknown__' });
     return out;
   }
+  // Shape B: { questions: [{user_answer}] }
   if (Array.isArray(rec.questions)) {
     for (const q of rec.questions as Array<Record<string, unknown>>) {
       const choice = (q.user_answer || q.answer || q.choice || '__unknown__') as string;
@@ -188,9 +231,11 @@ function extractUserChoices(
     while (out.length < questionCount) out.push({ choice: '__unknown__' });
     return out;
   }
-  // Fall back: stringify and log first 100 chars to help future debugging.
+  // Unrecognized shape: log it for postmortem (never embed it in the record —
+  // that poisons user_choice for every downstream metric).
+  diag?.(`answer-extract: unrecognized tool_response shape: ${JSON.stringify(response).slice(0, 300)}`);
   for (let i = 0; i < questionCount; i++) {
-    out.push({ choice: `__response-shape-unknown:${JSON.stringify(response).slice(0, 80)}__` });
+    out.push({ choice: '__unknown__' });
   }
   return out;
 }
@@ -204,22 +249,19 @@ function detectSkill(cwd: string | undefined): string {
   return 'unknown';
 }
 
-function spawnLog(payload: Record<string, unknown>, cwd?: string): void {
-  // Locate the bin relative to this script's directory.
-  const here = path.dirname(new URL(import.meta.url).pathname);
-  // hosts/claude/hooks/ -> ../../../bin/
-  const repoRoot = path.resolve(here, '..', '..', '..');
-  const bin = path.join(repoRoot, 'bin', 'gstack-question-log');
-  const res = spawnSync(bin, [JSON.stringify(payload)], {
+function spawnLog(payload: Record<string, unknown>, budgetMs: number, cwd?: string): void {
+  const startedAt = Date.now();
+  const res = runBin('gstack-question-log', [JSON.stringify(payload)], {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 3000,
+    timeout: budgetMs,
     // Run from the originating tool call's cwd so gstack-slug resolves to
     // the project the user is actually in, not the hook script's location.
     cwd: cwd && fs.existsSync(cwd) ? cwd : undefined,
   });
   if (res.status !== 0) {
-    logHookError(`gstack-question-log exited ${res.status}: ${res.stderr || res.stdout}`);
+    const how = res.signal ? ` (${res.signal} after ${Date.now() - startedAt} of ${budgetMs} ms)` : '';
+    logHookError(`gstack-question-log exited ${res.status}${how}: ${res.stderr || res.stdout}`);
   }
 }
 
@@ -251,7 +293,10 @@ async function main(): Promise<void> {
   }
 
   const skill = detectSkill(stdin.cwd);
-  const choices = extractUserChoices(stdin.tool_response, questions.length);
+  const choices = extractUserChoices(stdin.tool_response, questions, (msg) =>
+    logHookError(`${msg} (tool_use_id=${stdin.tool_use_id || 'n/a'})`),
+  );
+  if (process.platform === 'win32') resolveWindowsBashCached(path.join(resolveStateRoot(), 'cache', 'windows-bash.json'));
 
   for (let i = 0; i < questions.length; i++) {
     const q = questions[i];
@@ -259,7 +304,7 @@ async function main(): Promise<void> {
     if (!qText) continue;
 
     const opts = optionLabels(q.options || []);
-    const { id, stripped_question } = extractQuestionId(skill, qText, opts);
+    const { id, signal_key, stripped_question } = extractQuestionId(skill, qText, opts);
     const recommended = extractRecommended(stripped_question, opts);
     const summary = stripped_question.slice(0, 200);
     const choice = choices[i] || { choice: '__unknown__' };
@@ -275,15 +320,24 @@ async function main(): Promise<void> {
       tool_use_id: stdin.tool_use_id?.slice(0, 128),
     };
     if (recommended) payload.recommended = recommended.slice(0, 64);
+    if (signal_key) payload.signal_key = signal_key;
     if (choice.free_text) payload.free_text = String(choice.free_text);
 
-    spawnLog(payload, stdin.cwd);
+    const budgetMs = hookChildBudgetMs(HOOK_STARTED_AT);
+    const skip = launchSkipReason(budgetMs);
+    if (skip) {
+      logHookError(`gstack-question-log skipped for questions ${i + 1}-${questions.length}: ${skip}`);
+      break;
+    }
+    spawnLog(payload, budgetMs, stdin.cwd);
   }
 
   process.exit(0);
 }
 
-main().catch((e) => {
-  logHookError(`main crash: ${(e as Error).message}`);
-  process.exit(0);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    logHookError(`main crash: ${(e as Error).message}`);
+    process.exit(0);
+  });
+}

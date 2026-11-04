@@ -23,6 +23,7 @@ import * as path from 'path';
 import type { ParityBaseline, SkillBaselineEntry } from './capture-parity-baseline';
 import { captureBaseline } from './capture-parity-baseline';
 import { CARVE_GUARDS } from './carve-guards';
+import { ledgerFailure, readSizeLedger } from './size-ledger';
 
 export interface ParityInvariant {
   skill: string;
@@ -50,6 +51,8 @@ export interface ParityInvariant {
   sectioned?: boolean;
   /** Max bytes for the always-loaded skeleton SKILL.md (carved skills only). */
   maxSkeletonBytes?: number;
+  /** Size ledger directory (test/helpers/size-ledger.ts): union bytes must equal its total; replaces maxSizeRatio. */
+  sizeLedger?: string;
 }
 
 export interface ParityCheckResult {
@@ -121,7 +124,10 @@ export function checkSkillParity(
   }
 
   // SIZE checks (union bytes for carved skills, skeleton bytes for monoliths)
-  if (invariant.maxSizeRatio !== undefined && baseline) {
+  if (invariant.sizeLedger !== undefined) {
+    const failure = ledgerFailure(invariant.skill, checkBytes, readSizeLedger(repoRoot, invariant.sizeLedger), baseline?.skillMdBytes);
+    if (failure) failures.push(failure);
+  } else if (invariant.maxSizeRatio !== undefined && baseline) {
     const ratio = checkBytes / baseline.skillMdBytes;
     if (ratio > invariant.maxSizeRatio) {
       failures.push(`size ratio ${ratio.toFixed(3)} > maxSizeRatio ${invariant.maxSizeRatio}`);
@@ -206,45 +212,10 @@ export function runParityChecks(opts: {
  */
 const MONOLITH_INVARIANTS: ParityInvariant[] = [
   // cso is now carved — its invariant is generated from CARVE_GUARDS below.
-  {
-    skill: 'review',
-    mustContain: ['confidence', 'P1', 'P2'],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    // The adversarial step swapped its bare `command -v codex` check for the shared
-    // codexPreflight() block (install + auth tri-state + CODEX_MODE branch prose),
-    // landing ~6.3% over the v1.53.0.0 baseline. Intentional: it adds proper
-    // not-installed vs not-authed handling, not slop.
-    maxSizeRatio: 1.08,
-    minBytes: 70_000,
-  },
-  {
-    skill: 'qa',
-    mustContain: ['bug', 'browse', 'fix'],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    // v1.2.0 activation lift: the unified first-run-guidance section (P4 scaffold +
-    // P3 loop tip) is added to every skill's shared preamble — intentional, ~1KB.
-    maxSizeRatio: 1.07,
-    minBytes: 50_000,
-  },
-  {
-    skill: 'investigate',
-    mustContain: ['root cause', 'hypothes'],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB + the
-    // cross-session decision-memory nudge) lands this skill just over the strict 1.05;
-    // headroom for the shared preamble additions (matches the carved-skill overrides).
-    // v1.2.0 activation lift adds the first-run-guidance section on top.
-    maxSizeRatio: 1.09,
-    minBytes: 30_000,
-  },
-  {
-    skill: 'autoplan',
-    mustContain: ['ceo', 'eng', 'design'],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    // v1.2.0 activation lift: shared first-run-guidance preamble section.
-    maxSizeRatio: 1.07,
-    minBytes: 70_000,
-  },
+  // review, codex, land-and-deploy (w1), autoplan (w2), qa (w3) carved in token-reduction Phase 4
+  // wave 1 (v1.69.x branch) — their invariants generate from CARVE_GUARDS too.
+  // investigate carved in the multi-agent wave (PR D3, 2026-10-10): its 1.12
+  // cap moved to CARVE_GUARDS.investigate.maxSizeRatio with the union measured.
 ];
 
 /**
@@ -262,8 +233,10 @@ const CARVED_INVARIANTS: ParityInvariant[] = Object.values(CARVE_GUARDS).map((g)
   maxSkeletonBytes: g.maxSkeletonBytes,
   minBytes: g.minUnionBytes,
   mustContain: g.mustContain,
-  mustHaveHeadings: ['## Preamble', '## When to invoke'],
-  maxSizeRatio: g.maxSizeRatio ?? 1.05,
+  // CSO's helper trust boundary requires its private startup; demanding the
+  // shared Preamble here would silently reintroduce conflicting policy.
+  mustHaveHeadings: g.skill === 'cso' ? [] : ['## Preamble'],
+  ...(g.sizeLedger ? { sizeLedger: g.sizeLedger } : { maxSizeRatio: g.maxSizeRatio ?? 1.05 }),
 }));
 
 export const PARITY_INVARIANTS: ParityInvariant[] = [
