@@ -153,6 +153,106 @@ describe("env.kv: a name-shaped literal inside a call is a file or dict key, not
   );
 });
 
+describe("env.kv: reading an environment variable in code names a secret without holding one (GST-1894)", () => {
+  const FAKE_KEY = "Zx9Qw8Er7Ty6Ui5Op4As3Df2";
+  const GH = ["ghp", "_", "Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh7Jk8Lm9Np0"].join("");
+  table(
+    "env.kv",
+    "MEDIUM",
+    [
+      String.raw`    token = opts?.env?.AGENT_API_TOKEN;`,
+      String.raw`token = ctx.env.AGENT_API_TOKEN;`,
+      String.raw`token = env?.AGENT_API_TOKEN;`,
+      String.raw`token = env.AGENT_API_TOKEN,`,
+      String.raw`token = import.meta.env.VITE_API_TOKEN;`,
+      String.raw`token = Bun.env.AGENT_API_TOKEN;`,
+      String.raw`token = this.env!.AGENT_API_TOKEN;`,
+      String.raw`token = process.env.AGENT_API_TOKEN;`,
+      String.raw`token = process.env["AGENT_API_TOKEN"];`,
+      String.raw`token = opts?.env?.["AGENT_API_TOKEN"];`,
+      String.raw`token = os.environ["OPENROUTER_API_KEY_V2"]`,
+      String.raw`token = os.getenv("OPENROUTER_API_KEY_V2")`,
+      String.raw`token = System.getenv("AGENT_API_TOKEN");`,
+    ],
+    [
+      String.raw`token = "${FAKE_KEY}"`,
+      `AGENT_API_TOKEN=${FAKE_KEY}`,
+      `export AGENT_API_TOKEN=${FAKE_KEY}`,
+      String.raw`token = opts?.env?.AGENT_API_TOKEN ?? "${FAKE_KEY}"`,
+      String.raw`token = env.AGENT_API_TOKEN||"${FAKE_KEY}"`,
+      String.raw`token = process.env["AGENT_API_TOKEN"] || "${FAKE_KEY}"`,
+      String.raw`token = os.getenv("AGENT_API_TOKEN", "${FAKE_KEY}")`,
+      String.raw`token = process.env["${FAKE_KEY}"]`,
+      String.raw`token = os.environ["${FAKE_KEY}"]`,
+      `token = env.${FAKE_KEY}`,
+      String.raw`token = myenv.AGENT_API_TOKEN;`,
+    ],
+  );
+
+  test("a known key prefix beside an env name still reports HIGH", () => {
+    for (const input of [`AGENT_API_TOKEN=${GH}`, String.raw`token = opts?.env?.AGENT_API_TOKEN ?? "${GH}"`]) {
+      expect(findings(input).some((f) => f.severity === "HIGH")).toBe(true);
+    }
+  });
+});
+
+describe("env.kv: the env-read exemption needs a finished expression with no fallback; otherwise the line reads as on main (GST-1894)", () => {
+  const FAKE_KEY = "Zx9Qw8Er7Ty6Ui5Op4As3Df2";
+  const kv = (text: string) => findings(text).some((f) => f.id === "env.kv");
+  test.each([
+    ["comment after ??", String.raw`token = opts?.env?.AGENT_API_TOKEN ?? // fallback` + "\n" + String.raw`  "${FAKE_KEY}";`],
+    ["blank line after ??", String.raw`token = opts?.env?.AGENT_API_TOKEN ??` + "\n\n" + String.raw`  "${FAKE_KEY}";`],
+    ["fallback wrapped after ??", String.raw`token = opts?.env?.AGENT_API_TOKEN ??` + "\n" + String.raw`  "${FAKE_KEY}";`],
+    ["fallback on the next line", String.raw`token = opts?.env?.AGENT_API_TOKEN` + "\n" + String.raw`  ?? "${FAKE_KEY}";`],
+    ["|| on the next line", String.raw`token = env.AGENT_API_TOKEN` + "\n" + String.raw`  || "${FAKE_KEY}"`],
+    ["backtick fallback", "token = opts?.env?.AGENT_API_TOKEN ?? `" + FAKE_KEY + "`;"],
+    ["backtick concatenation", "token = ctx.env.AGENT_API_TOKEN + `" + FAKE_KEY + "`;"],
+    ["ternary", "token = opts?.env?.AGENT_API_TOKEN ? opts.env.AGENT_API_TOKEN : `" + FAKE_KEY + "`;"],
+    ["python or", String.raw`token = ctx.env.AGENT_API_TOKEN or FALLBACK_TOKEN_VALUE`],
+    ["getenv default", String.raw`token = System.getenv("AGENT_API_TOKEN", "${FAKE_KEY}");`],
+    ["call left open", String.raw`token = System.getenv("AGENT_API_TOKEN")`],
+  ])("fires as on main: %s", (_, input) => {
+    expect(kv(input)).toBe(true);
+  });
+  test.each([
+    ["multi-line call", ["client = OpenAI(", String.raw`    api_key=os.getenv("OPENAI_API_KEY"),`, String.raw`    base_url="https://api.openai.com/v1",`, ")"].join("\n")],
+    ["object property", String.raw`  token: opts?.env?.AGENT_API_TOKEN,`],
+    ["code span in a comment", "token = make_token(user)  // `process.env.AGENT_API_TOKEN` fallback"],
+    ["getenv with an empty default", String.raw`token = os.getenv("OPENROUTER_API_KEY_V2", "")`],
+  ])("still exempt, as on main: %s", (_, input) => {
+    expect(kv(input)).toBe(false);
+  });
+});
+
+describe("env.kv: a lowercase fixture label that names itself a secret, in a test file only (GST-1894)", () => {
+  const kv = (text: string, sourcePath?: string) => scan(text, { repoVisibility: "private", sourcePath }).findings.some((f) => f.id === "env.kv");
+  test.each([
+    ["memory-registry-pg.test.ts", '      clientSecret: "personal-secret",'],
+    ["memory-registry-pg.test.ts", '  signingSecret: "memory-authority-signing-secret",'],
+    ["auth.spec.tsx", "    apiKey: 'staging-api-key',"],
+    ["test_auth.py", '    password = "admin_password_fixture"'],
+    ["auth_test.go", '  token: "refresh-token-value",'],
+  ])("clean in %s: %s", (file, input) => {
+    expect(kv(input, file)).toBe(false);
+  });
+  test.each([
+    ["memory-registry.ts", '      clientSecret: "personal-secret",'],
+    [undefined, '      clientSecret: "personal-secret",'],
+    ["deploy.env", "CLIENT_SECRET=personal-secret"],
+    ["memory-registry-pg.test.ts", '      clientSecret: "correct-horse-battery-staple",'],
+    ["memory-registry-pg.test.ts", '      clientSecret: "Personal-Secret-9x",'],
+    ["memory-registry-pg.test.ts", '      clientSecret: "secretive-horse",'],
+    ["memory-registry-pg.test.ts", '      clientSecret: "Zx9Qw8Er7Ty6Ui5Op4As3Df2",'],
+    ["memory-registry-pg.test.ts.bak", '      clientSecret: "personal-secret",'],
+    ["src/ab-test.ts", '      clientSecret: "personal-secret",'],
+    ["scripts/load-test.ts", '      clientSecret: "personal-secret",'],
+    ["src/test_helpers.ts", '      clientSecret: "personal-secret",'],
+    ["spec/auth_spec.rb", '      clientSecret: "personal-secret",'],
+  ])("still MEDIUM in %s: %s", (file, input) => {
+    expect(kv(input, file)).toBe(true);
+  });
+});
+
 describe("internal.hostname: per-machine config filenames are not hosts (#2962, #2740)", () => {
   table(
     "internal.hostname",
@@ -349,6 +449,51 @@ describe("pii.phone.e164: run ids in a runs= list or an actions/runs/ path (GST-
       "sales-actions/runs/4155550123",
       "runs=4162986182/1",
       "runs=1234567890123/1",
+    ],
+  );
+});
+
+describe("pii.phone.e164: a short sha after review_loop_grant or review_loop_exception (Free Tests 41667825418, 41766865679)", () => {
+  table(
+    "pii.phone.e164",
+    "MEDIUM",
+    [
+      // The ask gstack-approvals records for the owner's grant, here with a stop head whose 12-character sha is all digits.
+      "Owner grant: one scoped fix-check after round 2 (review_loop_grant 367120488513)",
+      "Owner accepts the stop after the fix-check (review_loop_exception 367120488513)",
+      "review_loop_grant=367120488513",
+      "review_loop_grant: 3671204885",
+    ],
+    [
+      "review_loop_grant +14155552671",
+      "review_loop_grant 415-555-2671",
+      "review_loop_grant (415) 555-2671",
+      "call 367120488513 about the review_loop_grant",
+      "grant 367120488513",
+      "my_review_loop_grant 367120488513",
+      "review_loop_grant for 367120488513",
+    ],
+  );
+});
+
+describe("pii.wallet: a bc1 address needs the bech32 alphabet and checksum (Free Tests 41715139988)", () => {
+  table(
+    "pii.wallet",
+    "MEDIUM",
+    [
+      // The sha the CSO history range printed as <REDACTED-pii.wallet>..<REDACTED-pii.wallet>; it holds 1 and b, outside bech32's alphabet.
+      "bc1f7576f1eaf9d548ddb6f742b85ec11b4a3e79..bc1f7576f1eaf9d548ddb6f742b85ec11b4a3e79",
+      // A sha inside the alphabet (no 1 or b after the prefix) fails the checksum.
+      "commit bc1f7576f2eaf9d548ddf6f742c85ec22d4a3e79",
+      // A real address with its last character changed fails the checksum too.
+      "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5",
+    ],
+    [
+      "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+      "send it to bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq today",
+      "wallet: bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+      "0x52908400098527886E0F7030069857D2E4169EE7",
+      "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
     ],
   );
 });

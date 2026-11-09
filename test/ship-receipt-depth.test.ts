@@ -9,10 +9,15 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { EXIT } from '../lib/headless-artifacts';
 import { extractReceipt, renderReceiptBlock } from '../lib/ship-receipt';
 import { bindShippedReceipt, receiptDepthAtHead, receiptDepthVerdict, reviewLoopExceptionLine } from '../lib/ship-receipt-depth';
-import { cleanup, commit, makeFixtureRepo, runBin, type FixtureRepo } from './helpers/pregate-fixture';
+import { bunIsolationArgs } from '../lib/bun-isolation';
+import { runScriptSync } from '../lib/script-invocation';
+import { BUMP_NEVER_KEY_VERSION, POLICY_KEY_INTRODUCED, TRAIN_GATES_KEY_VERSION } from '../lib/ship-policy';
+import { cmpVersion, parseVersion } from '../lib/version-source';
+import { cleanup, commit, makeFixtureRepo, ROOT, runBin, type FixtureRepo } from './helpers/pregate-fixture';
 
 const repos: FixtureRepo[] = [];
 afterEach(() => { while (repos.length) cleanup(repos.pop()!); });
@@ -47,6 +52,7 @@ describe('write records the review depth at the checked-out head', () => {
     expect(r.review_depth).toMatchObject({ depth: 'light', class: 'code', base, registry: base, gate_scan: { tagged: 0, head } });
     expect(r.review_depth!.runtime_lines).toBeGreaterThanOrEqual(5);
     expect(r.review_depth!.runtime_lines).toBeLessThanOrEqual(50);
+    expect(r.design).toBeUndefined();
     const other = path.join(repo.root, 'other.md');
     const bad = writeReceipt(repo, other, ['--head', older]);
     expect(bad.status).toBe(EXIT.fail);
@@ -54,6 +60,39 @@ describe('write records the review depth at the checked-out head', () => {
     expect(bad.err).toContain('(RECEIPT_INVALID)');
     expect(fs.existsSync(other)).toBe(false);
   }, 60_000);
+
+  // Value: protects=a rendered-UI diff's receipt says only the static design check ran and why (GST-1718), from the same
+  //   diff-scope the depth reads; fails_when=write records no design field on a frontend range, or records one on a
+  //   backend-only range (test above); seam=none
+  test('a template-UI diff records design: static (no preview declared)', () => {
+    const repo = makeFixtureRepo(); repos.push(repo);
+    commit(repo, { 'src/ui/row.ts': "import { html } from 'lit';\nexport const row = (n: string) => html`<div class=\"row\">${n}</div>`;\n" });
+    const body = path.join(repo.root, 'body.md');
+    const ok = writeReceipt(repo, body);
+    expect(ok.status).toBe(EXIT.ok);
+    expect(receiptIn(body).design).toEqual({ mode: 'static', reason: 'no preview declared' });
+  }, 60_000);
+
+  // Value: protects=a receipt names the gstack release that wrote it, never a newer policy key its tree carries, so a
+  // version check against a receipt cannot be passed by an older build (GST-1366); fails_when=write records the
+  // key-inflated version policy reading uses, or policy reading stops seeing the newest key; seam=none
+  test('a gstack whose VERSION is older than its newest policy key records that VERSION; policy reading still reads at the key', () => {
+    const repo = makeFixtureRepo(); repos.push(repo);
+    commit(repo, { 'lib/util.js': lines(3) });
+    const installed = path.join(repo.root, 'installed-gstack');
+    const sourceOnly = { recursive: true, filter: (file: string) => path.basename(file) !== 'node_modules' };
+    for (const dir of ['bin', 'lib', 'scripts', 'crew']) fs.cpSync(path.join(ROOT, dir), path.join(installed, dir), sourceOnly);
+    fs.writeFileSync(path.join(installed, 'VERSION'), '1.0.0.0\n');
+    const body = path.join(repo.root, 'body.md');
+    const write = runScriptSync(path.join(installed, 'bin', 'gstack-ship-receipt'), ['write', '--pr', '7', '--base', 'main', '--version', '1.0.0', '--session-kind', 'unattended', '--body', body],
+      { cwd: repo.work, encoding: 'utf8', timeout: 180_000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, ...repo.env } });
+    expect(write.status, write.stderr).toBe(EXIT.ok);
+    expect(receiptIn(body).gstack_version).toBe('1.0.0.0');
+    const newestKey = [...Object.values(POLICY_KEY_INTRODUCED), BUMP_NEVER_KEY_VERSION, TRAIN_GATES_KEY_VERSION].reduce((a, b) => (cmpVersion(parseVersion(b)!, parseVersion(a)!) > 0 ? b : a));
+    const reader = spawnSync(process.execPath, [...bunIsolationArgs(), '-e', `console.log((await import(${JSON.stringify(path.join(installed, 'lib', 'ship-policy.ts'))})).runningGstackVersion())`],
+      { cwd: repo.work, encoding: 'utf8', timeout: 60_000 });
+    expect(reader.stdout.trim(), reader.stderr).toBe(newestKey);
+  }, 120_000);
 });
 
 describe('the queue refuses a receipt below the depth its head needs', () => {
@@ -209,6 +248,41 @@ describe('the review-loop exception (#3559)', () => {
     const offBranch = bindShippedReceipt(repo.work, 'origin/main', forged, '7', [head]);
     expect(!offBranch.ok && offBranch.code).toBe('QUEUE_RECEIPT_EXCEPTION_INVALID');
     expect(!offBranch.ok && offBranch.message).toContain('is not the receipt head or an ancestor of it');
+  }, 90_000);
+});
+
+describe('the review-loop exception after the second full pass (TRUT-7, truther#1169)', () => {
+  // Value: protects=an owner who accepts an open finding under the two-round cap has a receipt path when /ship stopped after the
+  //   second full pass (passes=2 blocking_found=1 deferred=1, no fix-check); fails_when=write refuses that stop, accepts one with
+  //   fewer than two passes, no deferred finding, no finding id, both stop kinds or no body line, or the queue ignores the line;
+  //   seam=gstack-ship-receipt write and bindShippedReceipt; no_claim=finish's routing
+  test('write records it with the deferred finding named by id; a stop that is neither kind is still refused', () => {
+    const repo = makeFixtureRepo(); repos.push(repo);
+    const head = commit(repo, { 'lib/util.js': lines(3) });
+    const body = path.join(repo.root, 'body.md');
+    const exception = { accepted_by: 'TRUT-1', date: '2026-11-03', via: 'TRUT-7 relay', reason: 'the open finding ships as a note under the two-round cap', second_pass: { head, deferred: ['specialist#3'] } };
+    const arg = (e: unknown) => ['--review-loop-exception', JSON.stringify(e)];
+    const loop = (passes: number, deferred: number) => ['--review-loop', JSON.stringify({ passes, blocking_found: 1, deferred, noted: 2, fixed: 2, scope: 'frozen' })];
+    fs.writeFileSync(body, '## What changed\n');
+    for (const [extra, why] of [
+      [[...arg(exception), ...loop(1, 1)], 'passes >= 2'],
+      [[...arg(exception), ...loop(2, 0)], 'deferred >= 1'],
+      [[...arg({ ...exception, second_pass: { head, deferred: [] } }), ...loop(2, 1)], 'second_pass.deferred must name'],
+      [[...arg({ ...exception, fix_check: { head, findings: 1 } }), ...loop(2, 1)], 'exactly one of fix_check or second_pass'],
+      [[...arg({ ...exception, second_pass: { head: 'a'.repeat(40), deferred: ['specialist#3'] } }), ...loop(2, 1)], 'is not ' + head.slice(0, 12) + ' or an ancestor of it'],
+      [[...arg(exception), ...loop(2, 1)], 'does not carry the exception line verbatim'],
+    ] as Array<[string[], string]>) {
+      const out = writeReceipt(repo, body, extra);
+      expect([why, out.status, out.err.includes('(REVIEW_LOOP_EXCEPTION_INVALID;'), out.err.includes(why)]).toEqual([why, EXIT.fail, true, true]);
+    }
+    const line = reviewLoopExceptionLine(exception as never);
+    expect(line).toBe(`Review-loop exception: accepted by TRUT-1 2026-11-03 via TRUT-7 relay: the open finding ships as a note under the two-round cap (second full pass at ${head.slice(0, 12)}, deferred specialist#3)`);
+    fs.writeFileSync(body, `## What changed\n\n${line}\n`);
+    expect(writeReceipt(repo, body, [...arg(exception), ...loop(2, 1)]).status).toBe(EXIT.ok);
+    expect(receiptIn(body).review_loop_exception).toEqual(exception);
+    expect(bindShippedReceipt(repo.work, 'origin/main', fs.readFileSync(body, 'utf8'), '7', [head]).ok).toBe(true);
+    const dropped = bindShippedReceipt(repo.work, 'origin/main', fs.readFileSync(body, 'utf8').replace(line, ''), '7', [head]);
+    expect(!dropped.ok && dropped.code).toBe('QUEUE_RECEIPT_EXCEPTION_INVALID');
   }, 90_000);
 });
 
