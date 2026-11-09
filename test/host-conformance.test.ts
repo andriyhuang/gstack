@@ -28,10 +28,12 @@ const DISCOVERY: Record<string, string> = {
   kiro: '.kiro/skills',
   factory: '.factory/skills',
   opencode: '.config/opencode/skills',
+  qoder: '.qoder/skills',
   cursor: '.cursor/skills',
   copilot: '.copilot/skills',
   agy: '.gemini/antigravity-cli/skills',
   gemini: '.gemini/skills',
+  kimi: '.kimi-code/skills',
 };
 /** Every directory any host (or a shared agents layout) reads. */
 const ALL_DISCOVERY_DIRS = [...Object.values(DISCOVERY), '.agents/skills', '.hermes/skills'];

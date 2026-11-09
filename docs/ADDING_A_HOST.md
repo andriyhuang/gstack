@@ -2,7 +2,7 @@
 
 gstack uses a declarative host config system. Each supported AI coding agent
 (Claude, Codex, Factory, Kiro, OpenCode, Slate, Cursor, OpenClaw, Hermes,
-GBrain, Copilot, Antigravity, Gemini CLI, Qoder) is defined as a typed TypeScript config object built by the
+GBrain, Copilot, Antigravity, Gemini CLI, Qoder, Kimi Code) is defined as a typed TypeScript config object built by the
 `defineHost()` factory. Rendering a new host means creating one file and
 re-exporting it: the generator, tests, and validation pick it up. Installing
 it is not free: setup still has one install arm per installable host (see
@@ -359,6 +359,7 @@ hosts/
 ├── agy.ts           # Google Antigravity CLI
 ├── gemini.ts        # Google Gemini CLI
 ├── qoder.ts         # Qoder (通义灵码)
+├── kimi.ts          # Kimi Code
 └── index.ts         # Registry: imports all, derives Host type
 ```
 

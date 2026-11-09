@@ -26,6 +26,7 @@ import {
   qoder,
   agy,
   gemini,
+  kimi,
 } from '../hosts/index';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import { RESOLVERS } from '../scripts/resolvers';
@@ -39,8 +40,8 @@ const RESOLVER_NAMES = new Set(Object.keys(RESOLVERS));
 // ─── hosts/index.ts ─────────────────────────────────────────
 
 describe('hosts/index.ts', () => {
-  test('ALL_HOST_CONFIGS has 14 hosts', () => {
-    expect(ALL_HOST_CONFIGS.length).toBe(14);
+  test('ALL_HOST_CONFIGS has 15 hosts', () => {
+    expect(ALL_HOST_CONFIGS.length).toBe(15);
   });
 
   test('ALL_HOST_NAMES matches config names', () => {
@@ -65,6 +66,7 @@ describe('hosts/index.ts', () => {
     expect(qoder.name).toBe('qoder');
     expect(agy.name).toBe('agy');
     expect(gemini.name).toBe('gemini');
+    expect(kimi.name).toBe('kimi');
   });
 
   test('getHostConfig returns correct config', () => {

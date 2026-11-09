@@ -93,12 +93,14 @@ with `--copy`:
 | Claude Code | full | `--host claude` (default) | `/office-hours` | enforced (hooks block) | Codex CLI, signed in | `./setup --host claude` |
 | OpenAI Codex CLI | experimental | `--host codex` → `${CODEX_HOME:-~/.codex}/skills/gstack-*/` | ask for `gstack-office-hours` | advisory, not blocked | Claude Code CLI, signed in | `./setup --host codex` |
 | OpenCode | experimental | `--host opencode` → `~/.config/opencode/skills/gstack-*/` + `/gstack-*` commands | `/gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host opencode` |
+| Qoder | experimental | `--host qoder` → `~/.qoder/skills/gstack-*/` | `/office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host qoder` |
 | Cursor | experimental | `--host cursor` → `~/.cursor/skills/gstack-*/` | ask for `gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host cursor` |
 | Factory Droid | experimental | `--host factory` → `~/.factory/skills/gstack-*/` | ask for `gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host factory` |
 | Kiro | experimental | `--host kiro` → `~/.kiro/skills/gstack-*/` | ask for `gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host kiro` |
 | GitHub Copilot CLI | experimental | `--host copilot` → `~/.copilot/skills/gstack-*/` | `/gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host copilot` |
 | Antigravity CLI | experimental | `--host agy` (or `--host antigravity`) → `~/.gemini/antigravity-cli/skills/gstack-*/` | `/gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host agy` |
 | Gemini CLI | experimental | `--host gemini` (or `--host gemini-cli`) → `~/.gemini/skills/gstack-*/` | ask for `gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host gemini` |
+| Kimi Code | experimental | `--host kimi` → `~/.kimi-code/skills/gstack-*/` | `/skill:gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host kimi` |
 | Slate | instruction-only | `--host slate` (points at the Claude install; Slate reads `.claude/skills`) | `/office-hours` via the Claude install | advisory, not blocked | — | `./setup --host claude` |
 | OpenClaw | experimental | `--host openclaw` (five task skills and one `gstack` router skill in OpenClaw's skills folder; automatic when setup runs inside OpenClaw; ACP route in [docs/OPENCLAW.md](docs/OPENCLAW.md)) | ask for the task; the agent opens the matching task skill or the `gstack` router | advisory, not blocked | — | `./setup --host openclaw` |
 | Hermes | experimental | `--host hermes` (every skill in `$HERMES_HOME/skills/gstack`; automatic when setup runs inside Hermes) | ask for the task, or `/gstack-review` | advisory, not blocked | — | `./setup --host hermes` |

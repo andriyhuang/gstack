@@ -48,6 +48,7 @@ lib/cso/images/gstack-cso-preparation
 .gbrain/
 .gbrain-source
 .qoder/
+.kimi-code/
 # Hosts installed from this checkout (bin/gstack-host-renders.sh, #1694)
 .gstack-installed-hosts
 .context/
