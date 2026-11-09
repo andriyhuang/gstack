@@ -15,7 +15,7 @@
  */
 import * as path from 'node:path';
 import { SPECIALISTS } from './review-depth';
-import { rank, readLedger, type LedgerBlocker } from './review-ledger';
+import { quarantinedIds, rank, readLedger, type LedgerBlocker } from './review-ledger';
 import { parseSpecialistOutput } from './state-matrix';
 
 export type Locus = 'diff' | 'fix-range' | 'outside';
@@ -389,7 +389,8 @@ export function ledgerPass(ledger: string, key = (id: string) => id): LedgerPass
   const events = readLedger(ledger);
   const started = Date.parse(String(events[0]?.at ?? ''));
   const fixCheck = events.some(e => e.event === 'output' && e.reader === 'fix-check' && e.tree_ok !== false && ((Array.isArray(e.ids) && e.ids.length > 0) || e.review === true));
-  const ids = events.flatMap(e => (e.event === 'output' && Array.isArray(e.ids) ? (e.ids as string[]) : e.event === 'judgment' && e.kind === 'added' && typeof e.id === 'string' ? [e.id] : [])).map(key);
+  const gone = quarantinedIds(events);
+  const ids = events.flatMap(e => (e.event === 'output' && Array.isArray(e.ids) ? (e.ids as string[]).filter(id => !gone.has(id)) : e.event === 'judgment' && e.kind === 'added' && typeof e.id === 'string' ? [e.id] : [])).map(key);
   return { started: Number.isFinite(started) ? started : NaN, fixCheck, ids, name: path.basename(path.dirname(path.resolve(ledger))), judged: events.some(e => e.event === 'judge') };
 }
 
@@ -467,8 +468,8 @@ export function summarizeReviewLoop(rows: readonly Record<string, any>[], since:
     }
   }
   for (const p of ledgerPasses) {
-    const n = /^p(\d+)$/.exec(p.name ?? '')?.[1];
-    if (n && !passes.some(r => String(r.pass) === n)) unbound.push(`pass ${n} (ledger ${p.name}): no review-log row, so its fixes and dispositions cannot be counted`);
+    const n = passNo(p);
+    if (n !== undefined && Number.isFinite(n) && !passes.some(r => String(r.pass) === String(n))) unbound.push(`pass ${n} (ledger ${p.name}): no review-log row, so its fixes and dispositions cannot be counted`);
   }
   const known = ledgerPasses.some(p => p.ids) ? new Set(ledgerPasses.flatMap(p => p.ids ?? [])) : null;
   if (known) for (const [, s] of seen) if (s.ledgerId && !known.has(s.ledgerId)) unbound.push(`ledger_id ${s.ledgerId}: no dispatch ledger of this run collected it`);
